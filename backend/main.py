@@ -1,6 +1,7 @@
 import warnings
 import asyncio
 import json
+import logging
 import re
 import shlex
 import shutil
@@ -22,6 +23,7 @@ from pydantic import BaseModel
 from supabase import create_client
 
 warnings.filterwarnings("ignore")
+logger = logging.getLogger(__name__)
 
 from dotenv import load_dotenv
 import os
@@ -72,6 +74,58 @@ ALL_ETFS = [
     "DJP","SPY","QQQ","XLF","XLU","XLV","XLP","VNQ","XLE",
 ]
 
+MACRO_FIELD_NAMES = [
+    "yield_1m",
+    "yield_3m",
+    "yield_6m",
+    "yield_1y",
+    "yield_2y",
+    "yield_3y",
+    "yield_5y",
+    "yield_7y",
+    "yield_10y",
+    "yield_20y",
+    "yield_30y",
+    "spread_10y2y",
+    "spread_10y3m",
+    "spread_5y10y",
+    "real_5y",
+    "real_7y",
+    "real_10y",
+    "real_20y",
+    "real_30y",
+    "bei_5y",
+    "bei_10y",
+    "bei_20y",
+    "bei_30y",
+    "oas_ig_all",
+    "oas_aaa",
+    "oas_bbb",
+    "oas_baa_10y",
+    "oas_hy_all",
+    "oas_bb",
+    "oas_b",
+    "oas_ccc",
+    "fed_funds",
+    "fed_upper",
+    "fed_lower",
+    "sofr",
+    "fed_balance",
+    "iorb",
+    "cpi",
+    "core_cpi",
+    "pce",
+    "core_pce",
+    "mortgage_30y",
+    "mortgage_15y",
+    "usd_broad",
+    "bund_10y",
+    "jgb_10y",
+    "gilt_10y",
+    "fed_debt",
+    "deficit",
+]
+
 SYSTEM_PROMPT = f"""You are a quantitative researcher at a hedge fund.
 Translate the plain-English trading strategy into a Python function.
 
@@ -111,17 +165,21 @@ jobs: dict[str, dict] = {}
 # LIFESPAN — preload macro data on startup
 # ─────────────────────────────────────────────────────────────
 
-_cached_macro: Optional[pd.DataFrame] = None
+_cached_macro_all: Optional[pd.DataFrame] = None
+_cached_macro_by_columns: dict[tuple[str, ...], pd.DataFrame] = {}
 
 
 async def preload_macro():
-    global _cached_macro
-    if _cached_macro is not None:
+    global _cached_macro_all
+    if _cached_macro_all is not None:
         return
     print("Preloading macro data from Supabase...")
     loop = asyncio.get_event_loop()
-    _cached_macro = await loop.run_in_executor(None, _load_macro_sync)
-    print(f"Macro data ready: {len(_cached_macro):,} rows × {len(_cached_macro.columns)} cols")
+    _cached_macro_all = await loop.run_in_executor(None, _get_macro_sync)
+    print(
+        f"Macro data ready: {len(_cached_macro_all):,} rows × "
+        f"{len(_cached_macro_all.columns)} cols"
+    )
 
 
 @asynccontextmanager
@@ -201,13 +259,30 @@ class BatchResult(BaseModel):
 # CORE ENGINE (sync — run in executor)
 # ─────────────────────────────────────────────────────────────
 
-def _load_macro_sync() -> pd.DataFrame:
+def _normalize_macro_columns(columns: Optional[list[str]]) -> tuple[str, ...]:
+    if not columns:
+        return tuple(MACRO_FIELD_NAMES)
+    requested = sorted({column for column in columns if column})
+    return tuple(requested)
+
+
+def _infer_macro_columns(code: str) -> list[str]:
+    referenced = []
+    for column in MACRO_FIELD_NAMES:
+        if f"'{column}'" in code or f'"{column}"' in code:
+            referenced.append(column)
+    return sorted(set(referenced)) or MACRO_FIELD_NAMES.copy()
+
+
+def _load_macro_sync(columns: Optional[list[str]] = None) -> pd.DataFrame:
     client = create_client(SUPABASE_URL, SUPABASE_KEY)
     rows, page, limit = [], 0, 1000
+    requested = list(_normalize_macro_columns(columns))
+    select_clause = ",".join(["date", *requested])
     while True:
         res = (
             client.table(TABLE_NAME)
-            .select("*")
+            .select(select_clause)
             .gte("date", START)
             .lte("date", END)
             .order("date")
@@ -228,6 +303,28 @@ def _load_macro_sync() -> pd.DataFrame:
     for col in df.columns:
         df[col] = pd.to_numeric(df[col], errors="coerce")
     return df
+
+
+def _get_macro_sync(columns: Optional[list[str]] = None) -> pd.DataFrame:
+    global _cached_macro_all
+
+    cache_key = _normalize_macro_columns(columns)
+    if cache_key in _cached_macro_by_columns:
+        return _cached_macro_by_columns[cache_key]
+
+    if _cached_macro_all is not None:
+        subset = _cached_macro_all.loc[:, list(cache_key)].copy()
+        _cached_macro_by_columns[cache_key] = subset
+        return subset
+
+    macro = _load_macro_sync(list(cache_key))
+    _cached_macro_by_columns[cache_key] = macro
+
+    all_columns_key = tuple(MACRO_FIELD_NAMES)
+    if cache_key == all_columns_key:
+        _cached_macro_all = macro
+
+    return macro
 
 
 def _load_prices_sync(tickers: list, start: str, end: str) -> pd.DataFrame:
@@ -360,6 +457,14 @@ def _extract_code_from_notebook(notebook_path: Path) -> str:
     raise RuntimeError(f"Could not find generate_signals() in notebook: {notebook_path}")
 
 
+def _log_sphinx_logs(notebook_path: Path, stdout: str, stderr: str) -> None:
+    logger.info("Sphinx notebook: %s", notebook_path)
+    if stdout.strip():
+        logger.info("Sphinx stdout:\n%s", stdout.strip())
+    if stderr.strip():
+        logger.warning("Sphinx stderr:\n%s", stderr.strip())
+
+
 def _build_sphinx_env() -> dict:
     if not SPHINX_API_KEY:
         raise RuntimeError(
@@ -410,6 +515,7 @@ def _ask_sphinx_sync(user_prompt: str) -> str:
         check=False,
         env=_build_sphinx_env(),
     )
+    _log_sphinx_logs(notebook_path, result.stdout, result.stderr)
     if result.returncode != 0:
         raise RuntimeError(
             "sphinx-cli chat failed.\n"
@@ -434,13 +540,13 @@ def _execute_strategy(code: str, macro: pd.DataFrame, prices: pd.DataFrame) -> p
     try:
         exec(code, namespace)
     except Exception as e:
-        raise RuntimeError(f"Compile error: {e}")
+        raise RuntimeError(f"Compile error: {e}\n\nCode:\n{code}") from e
     if "generate_signals" not in namespace:
-        raise RuntimeError("No generate_signals() function found in generated code")
+        raise RuntimeError(f"No generate_signals() function found in generated code.\n\nCode:\n{code}")
     try:
         signals = namespace["generate_signals"](macro.copy(), prices.copy())
     except Exception as e:
-        raise RuntimeError(f"Runtime error in generate_signals(): {e}")
+        raise RuntimeError(f"Runtime error in generate_signals(): {e}\n\nCode:\n{code}") from e
     if not isinstance(signals, pd.DataFrame):
         raise RuntimeError(f"generate_signals() must return DataFrame, got {type(signals)}")
     return signals
@@ -533,14 +639,8 @@ def _run_single_backtest(
     initial_cash: float,
 ) -> dict:
     """Full pipeline for one prompt. Runs sync — call via executor."""
-    global _cached_macro
-
-    macro = _cached_macro
-    if macro is None:
-        macro = _load_macro_sync()
-        _cached_macro = macro
-
-    code       = _ask_llm_sync(prompt, model)
+    code = _ask_llm_sync(prompt, model)
+    macro = _get_macro_sync(_infer_macro_columns(code))
     referenced = [t for t in ALL_ETFS if f'"{t}"' in code or f"'{t}'" in code]
     if not referenced:
         referenced = ["TLT", "HYG", "GLD", "SPY", "TIP", "SHY"]
@@ -564,14 +664,8 @@ def _run_single_backtest_sphinx(
     initial_cash: float,
 ) -> dict:
     """Full pipeline for one prompt using Sphinx CLI. Runs sync — call via executor."""
-    global _cached_macro
-
-    macro = _cached_macro
-    if macro is None:
-        macro = _load_macro_sync()
-        _cached_macro = macro
-
     code = _ask_sphinx_sync(prompt)
+    macro = _get_macro_sync(_infer_macro_columns(code))
     referenced = [t for t in ALL_ETFS if f'"{t}"' in code or f"'{t}'" in code]
     if not referenced:
         referenced = ["TLT", "HYG", "GLD", "SPY", "TIP", "SHY"]
@@ -651,10 +745,11 @@ def root():
 
 @app.get("/health", tags=["Health"])
 def health():
+    macro = _cached_macro_all
     return {
         "status"      : "ok",
-        "macro_loaded": _cached_macro is not None,
-        "macro_rows"  : len(_cached_macro) if _cached_macro is not None else 0,
+        "macro_loaded": macro is not None,
+        "macro_rows"  : len(macro) if macro is not None else 0,
     }
 
 
@@ -665,17 +760,21 @@ def list_etfs():
 
 @app.get("/macro/columns", tags=["Config"])
 def list_macro_columns():
-    if _cached_macro is None:
-        raise HTTPException(503, "Macro data not yet loaded")
-    return {"columns": sorted(_cached_macro.columns.tolist())}
+    try:
+        macro = _get_macro_sync()
+    except Exception as e:
+        raise HTTPException(503, str(e))
+    return {"columns": sorted(macro.columns.tolist())}
 
 
 @app.get("/macro/snapshot", tags=["Data"])
 def macro_snapshot():
     """Latest available macro values — useful for prompt context."""
-    if _cached_macro is None:
-        raise HTTPException(503, "Macro data not yet loaded")
-    latest = _cached_macro.iloc[-1].dropna()
+    try:
+        macro = _get_macro_sync()
+    except Exception as e:
+        raise HTTPException(503, str(e))
+    latest = macro.iloc[-1].dropna()
     return {
         "date"  : str(latest.name.date()),
         "values": {k: round(float(v), 4) for k, v in latest.items()},
