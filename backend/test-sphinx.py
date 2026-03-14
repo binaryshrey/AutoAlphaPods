@@ -31,6 +31,7 @@ SUPABASE_KEY = (
     "xifg2CrZv9330qQTXC0515Gk_fyLnS5KAG2C1a_TQyM"
 )
 TABLE_NAME = "fi_macro_data"
+SPHINX_API_KEY = "sk_live_eLbVU62dgi_8DkwsidR4KYaUtw2rmNyjJ070N5tUhb4"
 
 START = "2000-05-01"
 END = "2025-01-01"
@@ -215,7 +216,13 @@ def extract_code_from_notebook(notebook_path: Path) -> str:
 
 def ensure_sphinx_ready() -> None:
     cmd = [resolve_sphinx_cli(), "status"]
-    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        check=False,
+        env=build_sphinx_env(),
+    )
     if result.returncode != 0:
         raise RuntimeError(
             "sphinx-cli status failed. Run `sphinx-cli login` first.\n"
@@ -240,7 +247,13 @@ def ask_sphinx_for_strategy(user_prompt: str) -> str:
 
     cmd = build_sphinx_command(prompt, str(notebook_path))
 
-    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        check=False,
+        env=build_sphinx_env(),
+    )
     if result.returncode != 0:
         raise RuntimeError(
             "sphinx-cli chat failed.\n"
@@ -258,6 +271,17 @@ def ask_sphinx_for_strategy(user_prompt: str) -> str:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
     return code
+
+
+def build_sphinx_env() -> dict:
+    if not SPHINX_API_KEY:
+        raise RuntimeError(
+            "SPHINX_API_KEY is not set. Export it to authenticate without browser login."
+        )
+
+    env = os.environ.copy()
+    env["SPHINX_API_KEY"] = SPHINX_API_KEY
+    return env
 
 
 # ─────────────────────────────────────────────────────────────

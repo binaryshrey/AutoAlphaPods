@@ -1,17 +1,25 @@
 import warnings
+import asyncio
+import json
+import re
+import shlex
+import shutil
+import subprocess
+import tempfile
+import uuid
+from contextlib import asynccontextmanager
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
 import numpy as np
 import pandas as pd
 import yfinance as yf
-from supabase import create_client
-from typing import Optional
-from openai import OpenAI
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
+from openai import OpenAI
 from pydantic import BaseModel
-import uuid
-import asyncio
-from datetime import datetime
-from contextlib import asynccontextmanager
+from supabase import create_client
 
 warnings.filterwarnings("ignore")
 
@@ -28,6 +36,7 @@ OPENROUTER_BASE = os.getenv("OPENROUTER_BASE", "https://openrouter.ai/api/v1")
 MODEL           = os.getenv("MODEL", "anthropic/claude-sonnet-4-5")
 START           = os.getenv("START", "2000-05-01")
 END             = os.getenv("END", "2025-01-01")
+SPHINX_API_KEY  = os.getenv("SPHINX_API_KEY")
 
 # Fail fast on startup if required keys are missing
 _required = {"SUPABASE_URL": SUPABASE_URL, "SUPABASE_KEY": SUPABASE_KEY, "OPENROUTER_KEY": OPENROUTER_KEY}
@@ -86,6 +95,8 @@ Hard rules:
 5. Return a DataFrame, never a Series
 6. Resample to monthly (.resample('ME').last()) then reindex to daily prices index
 """
+
+SPHINX_OUTPUT_CODE_BLOCK = re.compile(r"```(?:python)?\s*(.*?)```", re.DOTALL)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -260,6 +271,164 @@ def _ask_llm_sync(prompt: str, model: str) -> str:
     return code.strip()
 
 
+def _resolve_sphinx_cli() -> str:
+    configured = os.getenv("SPHINX_CLI_BIN")
+    if configured:
+        return configured
+
+    for candidate in (
+        "sphinx-cli",
+        str(Path.home() / ".local" / "bin" / "sphinx-cli"),
+    ):
+        resolved = shutil.which(candidate)
+        if resolved:
+            return resolved
+
+    raise RuntimeError(
+        "sphinx-cli not found on PATH. Set SPHINX_CLI_BIN to the executable path."
+    )
+
+
+def _build_sphinx_command(prompt: str, notebook_filepath: str) -> list[str]:
+    cmd = [
+        _resolve_sphinx_cli(),
+        "chat",
+        "--prompt",
+        prompt,
+        "--notebook-filepath",
+        notebook_filepath,
+    ]
+
+    optional_flags = {
+        "SPHINX_URL": "--sphinx-url",
+        "SPHINX_JUPYTER_SERVER_URL": "--jupyter-server-url",
+        "SPHINX_JUPYTER_SERVER_TOKEN": "--jupyter-server-token",
+        "SPHINX_RULES_PATH": "--sphinx-rules-path",
+    }
+    for env_var, flag in optional_flags.items():
+        value = os.getenv(env_var)
+        if value:
+            cmd.extend([flag, value])
+
+    for env_var, flag in (
+        ("SPHINX_NO_MEMORY_READ", "--no-memory-read"),
+        ("SPHINX_NO_MEMORY_WRITE", "--no-memory-write"),
+        ("SPHINX_NO_PACKAGE_INSTALLATION", "--no-package-installation"),
+        ("SPHINX_NO_COLLAPSE_EXPLORATORY_CELLS", "--no-collapse-exploratory-cells"),
+        ("SPHINX_NO_FILE_SEARCH", "--no-file-search"),
+        ("SPHINX_NO_RIPGREP_INSTALLATION", "--no-ripgrep-installation"),
+        ("SPHINX_NO_WEB_SEARCH", "--no-web-search"),
+        ("SPHINX_VERBOSE", "--verbose"),
+    ):
+        if os.getenv(env_var, "").lower() in {"1", "true", "yes"}:
+            cmd.append(flag)
+
+    log_level = os.getenv("SPHINX_LOG_LEVEL")
+    if log_level:
+        cmd.extend(["--log-level", log_level])
+
+    extra_args = os.getenv("SPHINX_CLI_EXTRA_ARGS")
+    if extra_args:
+        cmd.extend(shlex.split(extra_args))
+
+    return cmd
+
+
+def _extract_code_from_sphinx_output(output: str) -> str:
+    matches = SPHINX_OUTPUT_CODE_BLOCK.findall(output)
+    if matches:
+        return matches[-1].strip()
+
+    start = output.find("def generate_signals(")
+    if start >= 0:
+        return output[start:].strip()
+
+    raise RuntimeError(f"Could not find generate_signals() in Sphinx output:\n{output}")
+
+
+def _extract_code_from_notebook(notebook_path: Path) -> str:
+    if not notebook_path.exists():
+        raise RuntimeError(f"Sphinx notebook was not created: {notebook_path}")
+
+    notebook = json.loads(notebook_path.read_text())
+    for cell in reversed(notebook.get("cells", [])):
+        source = "".join(cell.get("source", []))
+        if "def generate_signals(" in source:
+            start = source.find("def generate_signals(")
+            return source[start:].strip()
+
+    raise RuntimeError(f"Could not find generate_signals() in notebook: {notebook_path}")
+
+
+def _build_sphinx_env() -> dict:
+    if not SPHINX_API_KEY:
+        raise RuntimeError(
+            "SPHINX_API_KEY is not set. Export it to authenticate without browser login."
+        )
+
+    env = os.environ.copy()
+    env["SPHINX_API_KEY"] = SPHINX_API_KEY
+    return env
+
+
+def _ensure_sphinx_ready() -> None:
+    cmd = [_resolve_sphinx_cli(), "status"]
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        check=False,
+        env=_build_sphinx_env(),
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            "sphinx-cli status failed. Run `sphinx-cli login` first.\n"
+            f"stdout:\n{result.stdout}\n\nstderr:\n{result.stderr}"
+        )
+
+
+def _ask_sphinx_sync(user_prompt: str) -> str:
+    _ensure_sphinx_ready()
+    prompt = f"{SYSTEM_PROMPT}\n\nTrading strategy:\n{user_prompt}"
+
+    keep_notebooks = os.getenv("SPHINX_KEEP_NOTEBOOKS", "").lower() in {"1", "true", "yes"}
+    explicit_notebook = os.getenv("SPHINX_NOTEBOOK_FILEPATH")
+
+    temp_dir: Optional[str] = None
+    if explicit_notebook:
+        notebook_path = Path(explicit_notebook).expanduser().resolve()
+        notebook_path.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        temp_dir = tempfile.mkdtemp(prefix="sphinx-run-", dir=str(Path.cwd()))
+        notebook_path = Path(temp_dir) / "strategy.ipynb"
+
+    cmd = _build_sphinx_command(prompt, str(notebook_path))
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        check=False,
+        env=_build_sphinx_env(),
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            "sphinx-cli chat failed.\n"
+            f"Command: {' '.join(cmd)}\n"
+            f"stdout:\n{result.stdout}\n\nstderr:\n{result.stderr}"
+        )
+
+    stdout = result.stdout.strip()
+    try:
+        code = _extract_code_from_sphinx_output(stdout)
+    except RuntimeError:
+        code = _extract_code_from_notebook(notebook_path)
+
+    if temp_dir and not keep_notebooks:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+    return code
+
+
 def _execute_strategy(code: str, macro: pd.DataFrame, prices: pd.DataFrame) -> pd.DataFrame:
     namespace = {"pd": pd, "np": np}
     try:
@@ -388,6 +557,39 @@ def _run_single_backtest(
     return metrics
 
 
+def _run_single_backtest_sphinx(
+    prompt: str,
+    start: str,
+    end: str,
+    initial_cash: float,
+) -> dict:
+    """Full pipeline for one prompt using Sphinx CLI. Runs sync — call via executor."""
+    global _cached_macro
+
+    macro = _cached_macro
+    if macro is None:
+        macro = _load_macro_sync()
+        _cached_macro = macro
+
+    code = _ask_sphinx_sync(prompt)
+    referenced = [t for t in ALL_ETFS if f'"{t}"' in code or f"'{t}'" in code]
+    if not referenced:
+        referenced = ["TLT", "HYG", "GLD", "SPY", "TIP", "SHY"]
+
+    prices = _load_prices_sync(referenced, start, end)
+    signals = _execute_strategy(code, macro, prices)
+
+    port_returns, equity = _simulate_portfolio(signals, prices, initial_cash)
+    metrics = _compute_metrics(
+        port_returns,
+        equity,
+        prompt,
+        tickers=signals.columns.tolist(),
+        code=code,
+    )
+    return metrics
+
+
 def _run_batch_job(job_id: str, request: BatchBacktestRequest):
     """Background task — runs all prompts and stores results in jobs dict."""
     jobs[job_id]["status"] = "running"
@@ -408,6 +610,29 @@ def _run_batch_job(job_id: str, request: BatchBacktestRequest):
     jobs[job_id]["status"]  = "done"
     jobs[job_id]["results"] = results
     jobs[job_id]["errors"]  = errors
+
+
+def _run_batch_job_sphinx(job_id: str, request: BatchBacktestRequest):
+    """Background task — runs all prompts with Sphinx CLI and stores results."""
+    jobs[job_id]["status"] = "running"
+    results = []
+    errors = []
+
+    for prompt in request.prompts:
+        try:
+            metrics = _run_single_backtest_sphinx(
+                prompt,
+                request.start,
+                request.end,
+                request.initial_cash,
+            )
+            results.append(metrics)
+        except Exception as e:
+            errors.append({"prompt": prompt, "error": str(e)})
+
+    jobs[job_id]["status"] = "done"
+    jobs[job_id]["results"] = results
+    jobs[job_id]["errors"] = errors
 
 
 # ─────────────────────────────────────────────────────────────
@@ -480,6 +705,26 @@ async def run_backtest(request: BacktestRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/backtest/sphinx", response_model=MetricsResult, tags=["Backtest"])
+async def run_backtest_sphinx(request: BacktestRequest):
+    """
+    Run a single backtest via Sphinx CLI for strategy generation.
+    """
+    loop = asyncio.get_event_loop()
+    try:
+        result = await loop.run_in_executor(
+            None,
+            _run_single_backtest_sphinx,
+            request.prompt,
+            request.start,
+            request.end,
+            request.initial_cash,
+        )
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/backtest/batch", response_model=JobStatus, tags=["Backtest"])
 async def run_batch_backtest(
     request: BatchBacktestRequest,
@@ -510,6 +755,39 @@ async def run_batch_backtest(
         status     = "pending",
         prompt     = f"{len(request.prompts)} prompts queued",
         created_at = jobs[job_id]["created_at"],
+    )
+
+
+@app.post("/backtest/sphinx/batch", response_model=JobStatus, tags=["Backtest"])
+async def run_batch_backtest_sphinx(
+    request: BatchBacktestRequest,
+    background_tasks: BackgroundTasks,
+):
+    """
+    Submit multiple prompts as a background job using Sphinx CLI.
+    Returns a job_id immediately — poll /backtest/batch/{job_id} for results.
+    """
+    if not request.prompts:
+        raise HTTPException(400, "prompts list cannot be empty")
+    if len(request.prompts) > 20:
+        raise HTTPException(400, "max 20 prompts per batch")
+
+    job_id = str(uuid.uuid4())
+    jobs[job_id] = {
+        "status": "pending",
+        "prompts": request.prompts,
+        "results": [],
+        "errors": [],
+        "created_at": datetime.utcnow().isoformat(),
+    }
+
+    background_tasks.add_task(_run_batch_job_sphinx, job_id, request)
+
+    return JobStatus(
+        job_id=job_id,
+        status="pending",
+        prompt=f"{len(request.prompts)} prompts queued",
+        created_at=jobs[job_id]["created_at"],
     )
 
 
