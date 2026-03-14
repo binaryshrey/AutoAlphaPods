@@ -84,6 +84,58 @@ ALL_ETFS = [
     "XLE",
 ]
 
+MACRO_FIELD_NAMES = [
+    "yield_1m",
+    "yield_3m",
+    "yield_6m",
+    "yield_1y",
+    "yield_2y",
+    "yield_3y",
+    "yield_5y",
+    "yield_7y",
+    "yield_10y",
+    "yield_20y",
+    "yield_30y",
+    "spread_10y2y",
+    "spread_10y3m",
+    "spread_5y10y",
+    "real_5y",
+    "real_7y",
+    "real_10y",
+    "real_20y",
+    "real_30y",
+    "bei_5y",
+    "bei_10y",
+    "bei_20y",
+    "bei_30y",
+    "oas_ig_all",
+    "oas_aaa",
+    "oas_bbb",
+    "oas_baa_10y",
+    "oas_hy_all",
+    "oas_bb",
+    "oas_b",
+    "oas_ccc",
+    "fed_funds",
+    "fed_upper",
+    "fed_lower",
+    "sofr",
+    "fed_balance",
+    "iorb",
+    "cpi",
+    "core_cpi",
+    "pce",
+    "core_pce",
+    "mortgage_30y",
+    "mortgage_15y",
+    "usd_broad",
+    "bund_10y",
+    "jgb_10y",
+    "gilt_10y",
+    "fed_debt",
+    "deficit",
+]
+
 SYSTEM_PROMPT = f"""You are a quantitative researcher at a hedge fund.
 Translate the plain-English trading strategy into a Python function.
 
@@ -213,6 +265,18 @@ def extract_code_from_notebook(notebook_path: Path) -> str:
     raise RuntimeError(f"Could not find generate_signals() in notebook: {notebook_path}")
 
 
+def print_sphinx_logs(notebook_path: Path, stdout: str, stderr: str) -> None:
+    console.print(f"  [dim]Sphinx notebook:[/] {notebook_path}")
+    if stdout.strip():
+        console.print("  [dim]Sphinx stdout:[/]")
+        for line in stdout.strip().splitlines():
+            console.print(f"    {line}")
+    if stderr.strip():
+        console.print("  [dim red]Sphinx stderr:[/]")
+        for line in stderr.strip().splitlines():
+            console.print(f"    [red]{line}[/]")
+
+
 def ensure_sphinx_ready() -> None:
     cmd = [resolve_sphinx_cli(), "status"]
     result = subprocess.run(cmd, capture_output=True, text=True, check=False)
@@ -241,6 +305,7 @@ def ask_sphinx_for_strategy(user_prompt: str) -> str:
     cmd = build_sphinx_command(prompt, str(notebook_path))
 
     result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    print_sphinx_logs(notebook_path, result.stdout, result.stderr)
     if result.returncode != 0:
         raise RuntimeError(
             "sphinx-cli chat failed.\n"
@@ -264,22 +329,37 @@ def ask_sphinx_for_strategy(user_prompt: str) -> str:
 # 2. DATA LOADERS
 # ─────────────────────────────────────────────────────────────
 
-_cached_macro: Optional[pd.DataFrame] = None
+_cached_macro: dict[tuple[str, ...], pd.DataFrame] = {}
 
 
-def load_macro() -> pd.DataFrame:
-    global _cached_macro
-    if _cached_macro is not None:
-        return _cached_macro
+def infer_macro_columns(code: str) -> list[str]:
+    referenced = []
+    for column in MACRO_FIELD_NAMES:
+        if f"'{column}'" in code or f'"{column}"' in code:
+            referenced.append(column)
 
-    console.print("  [dim]Loading macro data from Supabase...[/]")
+    unique_columns = sorted(set(referenced))
+    return unique_columns or MACRO_FIELD_NAMES.copy()
+
+
+def load_macro(columns: list[str]) -> pd.DataFrame:
+    requested = sorted(set(columns))
+    cache_key = tuple(requested)
+    if cache_key in _cached_macro:
+        return _cached_macro[cache_key]
+
+    console.print(
+        f"  [dim]Loading macro data from Supabase ({len(requested)} columns)...[/]"
+    )
     client = create_client(SUPABASE_URL, SUPABASE_KEY)
     rows, page, limit = [], 0, 1000
+    select_columns = ["date", *requested]
+    select_clause = ",".join(select_columns)
 
     while True:
         res = (
             client.table(TABLE_NAME)
-            .select("*")
+            .select(select_clause)
             .gte("date", START)
             .lte("date", END)
             .order("date")
@@ -300,7 +380,7 @@ def load_macro() -> pd.DataFrame:
     for col in df.columns:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    _cached_macro = df
+    _cached_macro[cache_key] = df
     console.print(f"  [dim]Loaded {len(df):,} rows × {len(df.columns)} columns.[/]")
     return df
 
@@ -497,13 +577,15 @@ def show_generated_code(prompt: str, code: str) -> None:
 def run_all(prompts: list[str]) -> None:
     ensure_sphinx_ready()
     all_metrics = []
-    macro = load_macro()
 
     for prompt in prompts:
         console.rule(f"[bold cyan]{prompt[:70]}")
         try:
             code = ask_sphinx_for_strategy(prompt)
             show_generated_code(prompt, code)
+
+            macro_columns = infer_macro_columns(code)
+            macro = load_macro(macro_columns)
 
             referenced = [ticker for ticker in ALL_ETFS if f'"{ticker}"' in code or f"'{ticker}'" in code]
             if not referenced:
