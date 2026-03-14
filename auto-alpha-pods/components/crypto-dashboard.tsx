@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect, useRef, useCallback } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import dynamic from "next/dynamic";
 import TradingDashboardModal from "@/components/trading-dashboard-modal";
 import {
@@ -48,6 +48,17 @@ interface GlobalData {
   total_volume: { usd: number };
   market_cap_change_percentage_24h_usd: number;
   market_cap_percentage: { btc: number; eth: number };
+}
+
+interface MarketItem {
+  symbol: string;
+  name: string;
+  price: number;
+  changePercent: number;
+  changeAbs: number;
+  marketCap: number;
+  volume: number;
+  sparkline: number[];
 }
 
 interface SentimentData {
@@ -268,6 +279,22 @@ function pct(n: number): string {
 }
 
 const DEFAULT_POSITION_NOTIONAL = 100;
+
+const ASSET_TABS = [
+  { label: "Crypto", value: "crypto" },
+  { label: "Fixed Income", value: "fixed-income" },
+  { label: "Equity", value: "equity" },
+  { label: "Commodity", value: "commodity" },
+] as const;
+
+type AssetTab = (typeof ASSET_TABS)[number]["value"];
+
+function normalizeAssetTab(value: string | null): AssetTab {
+  if (!value) return "crypto";
+  const normalized = value.toLowerCase();
+  const match = ASSET_TABS.find((tab) => tab.value === normalized);
+  return match?.value ?? "crypto";
+}
 
 function formatQtyFromNotional(
   price: number,
@@ -1468,8 +1495,14 @@ function VolumeBar({ coins }: { coins: CoinData[] }) {
 
 export default function CryptoDashboard() {
   const router = useRouter();
+  const searchParams = useSearchParams();
+  const activeAsset = normalizeAssetTab(searchParams.get("asset"));
+  const isCrypto = activeAsset === "crypto";
   const [coins, setCoins] = useState<CoinData[]>([]);
   const [globalData, setGlobalData] = useState<GlobalData | null>(null);
+  const [assetItems, setAssetItems] = useState<MarketItem[]>([]);
+  const [assetLoading, setAssetLoading] = useState(false);
+  const [assetRefreshing, setAssetRefreshing] = useState(false);
   const [predictions, setPredictions] = useState<PredictionMarket[]>([]);
   const [sentiment, setSentiment] = useState<SentimentData | null>(null);
   const [loading, setLoading] = useState(true);
@@ -1482,6 +1515,22 @@ export default function CryptoDashboard() {
   const [showTradingModal, setShowTradingModal] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
+
+  const updateAssetTab = useCallback(
+    (next: AssetTab) => {
+      const params = new URLSearchParams(searchParams.toString());
+      if (next === "crypto") {
+        params.delete("asset");
+      } else {
+        params.set("asset", next);
+      }
+      const queryString = params.toString();
+      router.replace(queryString ? `?${queryString}` : "/dashboard", {
+        scroll: false,
+      });
+    },
+    [router, searchParams],
+  );
 
   const fetchData = useCallback(async (silent = false) => {
     if (!silent) setLoading(true);
@@ -1516,11 +1565,50 @@ export default function CryptoDashboard() {
     }
   }, []);
 
+  const fetchAssetData = useCallback(
+    async (silent = false) => {
+      if (!silent) setAssetLoading(true);
+      else setAssetRefreshing(true);
+
+      try {
+        const res = await fetch(`/api/market-overview?asset=${activeAsset}`);
+        if (!res.ok) throw new Error(`${res.status}`);
+        const payload = (await res.json()) as { items?: MarketItem[] };
+        if (Array.isArray(payload.items)) setAssetItems(payload.items);
+        else setAssetItems([]);
+      } catch (e) {
+        console.error("Market overview error:", e);
+        setAssetItems([]);
+      } finally {
+        setAssetLoading(false);
+        setAssetRefreshing(false);
+      }
+    },
+    [activeAsset],
+  );
+
+  const refreshMarketData = useCallback(() => {
+    void fetchAssetData(true);
+    if (isCrypto) {
+      void fetchData(true);
+    }
+  }, [fetchAssetData, fetchData, isCrypto]);
+
   useEffect(() => {
+    if (!isCrypto) {
+      setLoading(false);
+      return;
+    }
     fetchData();
     const timer = setInterval(() => fetchData(true), 60_000);
     return () => clearInterval(timer);
-  }, [fetchData]);
+  }, [fetchData, isCrypto]);
+
+  useEffect(() => {
+    fetchAssetData();
+    const timer = setInterval(() => fetchAssetData(true), 60_000);
+    return () => clearInterval(timer);
+  }, [fetchAssetData]);
 
   useEffect(() => {
     if (showChat) chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -1832,24 +1920,69 @@ export default function CryptoDashboard() {
     }
   };
 
-  const gainers = coins
-    .filter((c) => c.price_change_percentage_24h > 0)
-    .sort(
-      (a, b) => b.price_change_percentage_24h - a.price_change_percentage_24h,
-    )
+  const cryptoItems = coins.map((coin) => ({
+    id: coin.id,
+    symbol: coin.symbol.toUpperCase(),
+    name: coin.name,
+    price: coin.current_price,
+    changePercent: coin.price_change_percentage_24h,
+    changeAbs: coin.price_change_24h,
+    marketCap: coin.market_cap,
+    volume: coin.total_volume,
+    sparkline: coin.sparkline_in_7d?.price ?? [],
+    image: coin.image,
+  }));
+
+  const yahooItems = assetItems.map((item) => ({
+    id: item.symbol,
+    symbol: item.symbol.toUpperCase(),
+    name: item.name,
+    price: item.price,
+    changePercent: item.changePercent,
+    changeAbs: item.changeAbs,
+    marketCap: item.marketCap,
+    volume: item.volume,
+    sparkline: item.sparkline,
+    image: undefined,
+  }));
+
+  const activeItems = isCrypto
+    ? yahooItems.length > 0
+      ? yahooItems
+      : cryptoItems
+    : yahooItems;
+  const marketOverviewItems = activeItems.slice(0, 10);
+
+  const summaryMarketCap = activeItems.reduce(
+    (sum, item) => sum + item.marketCap,
+    0,
+  );
+  const summaryVolume = activeItems.reduce((sum, item) => sum + item.volume, 0);
+  const summaryGainer = [...activeItems].sort(
+    (a, b) => b.changePercent - a.changePercent,
+  )[0];
+  const summaryLoser = [...activeItems].sort(
+    (a, b) => a.changePercent - b.changePercent,
+  )[0];
+
+  const gainers = activeItems
+    .filter((item) => item.changePercent > 0)
+    .sort((a, b) => b.changePercent - a.changePercent)
     .slice(0, 6);
 
-  const losers = coins
-    .filter((c) => c.price_change_percentage_24h < 0)
-    .sort(
-      (a, b) => a.price_change_percentage_24h - b.price_change_percentage_24h,
-    )
+  const losers = activeItems
+    .filter((item) => item.changePercent < 0)
+    .sort((a, b) => a.changePercent - b.changePercent)
     .slice(0, 6);
 
   const movers = activeTab === "gainers" ? gainers : losers;
+  const isPageLoading = isCrypto ? loading || assetLoading : assetLoading;
+  const isRefreshing = isCrypto
+    ? refreshing || assetRefreshing
+    : assetRefreshing;
 
   // ── Skeleton ──
-  if (loading) {
+  if (isPageLoading) {
     return (
       <div className="min-h-screen bg-[#000000] flex items-center justify-center">
         <div className="flex items-center gap-3 text-zinc-500">
@@ -1880,7 +2013,7 @@ export default function CryptoDashboard() {
             </button>
 
             {/* Sentiment widget */}
-            {sentiment && (
+            {isCrypto && sentiment && (
               <a
                 href="https://alternative.me/crypto/fear-and-greed-index/"
                 target="_blank"
@@ -1941,12 +2074,12 @@ export default function CryptoDashboard() {
             )}
 
             <button
-              onClick={() => fetchData(true)}
+              onClick={refreshMarketData}
               className="text-zinc-500 hover:text-zinc-200 transition-colors"
               title="Refresh"
             >
               <RefreshCw
-                className={`w-3.5 h-3.5 ${refreshing ? "animate-spin" : ""}`}
+                className={`w-3.5 h-3.5 ${isRefreshing ? "animate-spin" : ""}`}
               />
             </button>
           </div>
@@ -1963,8 +2096,28 @@ export default function CryptoDashboard() {
       <main className="max-w-7xl mx-auto px-5 py-5 pb-28">
         <div className="flex flex-col lg:flex-row lg:items-start gap-5">
           <div className="flex-1 min-w-0 space-y-5">
+            <div className="flex flex-wrap items-center gap-2 border-b border-white/[0.07] pb-3">
+              {ASSET_TABS.map((tab) => {
+                const isActive = tab.value === activeAsset;
+                return (
+                  <button
+                    key={tab.value}
+                    type="button"
+                    onClick={() => updateAssetTab(tab.value)}
+                    className={`rounded-full px-3 py-1.5 text-sm font-medium transition-colors border ${
+                      isActive
+                        ? "bg-white/10 text-white border-white/20"
+                        : "text-zinc-500 border-transparent hover:text-zinc-200 hover:border-white/10"
+                    }`}
+                  >
+                    {tab.label}
+                  </button>
+                );
+              })}
+            </div>
+
             {/* ── Global stats bar ── */}
-            {globalData && (
+            {isCrypto && globalData && (
               <div className="flex flex-wrap items-center gap-x-5 gap-y-2 text-sm text-zinc-500 border-b border-white/[0.05] pb-4">
                 <div className="flex items-center gap-1.5">
                   <Globe className="w-3 h-3" />
@@ -2003,6 +2156,46 @@ export default function CryptoDashboard() {
                 </div>
               </div>
             )}
+            {!isCrypto && activeItems.length > 0 && (
+              <div className="flex flex-wrap items-center gap-x-5 gap-y-2 text-sm text-zinc-500 border-b border-white/[0.05] pb-4">
+                <div className="flex items-center gap-1.5">
+                  <Globe className="w-3 h-3" />
+                  <span>Market Cap</span>
+                  <span className="text-zinc-200 font-medium">
+                    {fmtBig(summaryMarketCap)}
+                  </span>
+                </div>
+                <div className="flex items-center gap-1.5">
+                  <BarChart2 className="w-3 h-3" />
+                  <span>24h Volume</span>
+                  <span className="text-zinc-200 font-medium">
+                    {fmtBig(summaryVolume)}
+                  </span>
+                </div>
+                {summaryGainer && (
+                  <div className="flex items-center gap-1.5">
+                    <span>Top Gainer</span>
+                    <span className="text-zinc-200 font-medium">
+                      {summaryGainer.symbol}
+                    </span>
+                    <span className="text-emerald-400">
+                      {pct(summaryGainer.changePercent)}
+                    </span>
+                  </div>
+                )}
+                {summaryLoser && (
+                  <div className="flex items-center gap-1.5">
+                    <span>Top Loser</span>
+                    <span className="text-zinc-200 font-medium">
+                      {summaryLoser.symbol}
+                    </span>
+                    <span className="text-red-400">
+                      {pct(summaryLoser.changePercent)}
+                    </span>
+                  </div>
+                )}
+              </div>
+            )}
 
             {/* ── Market overview cards ── */}
             <section>
@@ -2010,67 +2203,68 @@ export default function CryptoDashboard() {
                 Market Overview
               </h2>
               <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-2.5">
-                {coins.slice(0, 10).map((coin) => {
-                  const pos = coin.price_change_percentage_24h >= 0;
-                  const changeAbs = Math.abs(coin.price_change_24h ?? 0);
-                  return (
-                    <div
-                      key={coin.id}
-                      onClick={() =>
-                        window.open(
-                          `https://www.coingecko.com/en/coins/${coin.id}`,
-                          "_blank",
-                          "noopener,noreferrer",
-                        )
-                      }
-                      className="group bg-[#0a0a0a] border border-white/[0.07] rounded-xl hover:border-white/[0.14] hover:bg-[#111] transition-all cursor-pointer overflow-hidden"
-                    >
-                      <div className="px-3.5 pt-3.5 pb-2">
-                        <div className="flex items-start justify-between gap-2">
-                          <div className="min-w-0">
-                            <p className="text-sm font-semibold text-white truncate leading-tight">
-                              {coin.name}
-                            </p>
-                            <p className="text-sm text-zinc-500 mt-1 tabular-nums">
-                              {fmt(coin.current_price)}
-                            </p>
-                          </div>
-                          <div className="text-right shrink-0">
-                            <span
-                              className={`text-sm font-semibold flex items-center justify-end gap-0.5 ${
-                                pos ? "text-emerald-400" : "text-red-400"
-                              }`}
-                            >
-                              {pos ? (
-                                <ArrowUpRight className="w-3 h-3" />
-                              ) : (
-                                <ArrowDownRight className="w-3 h-3" />
-                              )}
-                              {Math.abs(
-                                coin.price_change_percentage_24h,
-                              ).toFixed(2)}
-                              %
-                            </span>
-                            <p
-                              className={`text-sm font-medium mt-0.5 tabular-nums ${
-                                pos ? "text-emerald-600" : "text-red-600"
-                              }`}
-                            >
-                              {pos ? "+" : "-"}
-                              {fmt(changeAbs)}
-                            </p>
+                {marketOverviewItems.length === 0 ? (
+                  <div className="col-span-full bg-[#0a0a0a] border border-white/[0.07] rounded-xl p-6 text-center text-sm text-zinc-600">
+                    No market data available
+                  </div>
+                ) : (
+                  marketOverviewItems.map((item) => {
+                    const pos = item.changePercent >= 0;
+                    const changeAbs = Math.abs(item.changeAbs ?? 0);
+                    const detailUrl = `https://finance.yahoo.com/quote/${item.symbol}`;
+                    return (
+                      <div
+                        key={item.id}
+                        onClick={() =>
+                          window.open(
+                            detailUrl,
+                            "_blank",
+                            "noopener,noreferrer",
+                          )
+                        }
+                        className="group bg-[#0a0a0a] border border-white/[0.07] rounded-xl hover:border-white/[0.14] hover:bg-[#111] transition-all cursor-pointer overflow-hidden"
+                      >
+                        <div className="px-3.5 pt-3.5 pb-2">
+                          <div className="flex items-start justify-between gap-2">
+                            <div className="min-w-0">
+                              <p className="text-sm font-semibold text-white truncate leading-tight">
+                                {item.name}
+                              </p>
+                              <p className="text-sm text-zinc-500 mt-1 tabular-nums">
+                                {fmt(item.price)}
+                              </p>
+                            </div>
+                            <div className="text-right shrink-0">
+                              <span
+                                className={`text-sm font-semibold flex items-center justify-end gap-0.5 ${
+                                  pos ? "text-emerald-400" : "text-red-400"
+                                }`}
+                              >
+                                {pos ? (
+                                  <ArrowUpRight className="w-3 h-3" />
+                                ) : (
+                                  <ArrowDownRight className="w-3 h-3" />
+                                )}
+                                {Math.abs(item.changePercent).toFixed(2)}%
+                              </span>
+                              <p
+                                className={`text-sm font-medium mt-0.5 tabular-nums ${
+                                  pos ? "text-emerald-600" : "text-red-600"
+                                }`}
+                              >
+                                {pos ? "+" : "-"}
+                                {fmt(changeAbs)}
+                              </p>
+                            </div>
                           </div>
                         </div>
+                        {item.sparkline.length > 0 && (
+                          <CardSparkline data={item.sparkline} positive={pos} />
+                        )}
                       </div>
-                      {coin.sparkline_in_7d?.price && (
-                        <CardSparkline
-                          data={coin.sparkline_in_7d.price}
-                          positive={pos}
-                        />
-                      )}
-                    </div>
-                  );
-                })}
+                    );
+                  })
+                )}
               </div>
             </section>
 
@@ -2103,34 +2297,40 @@ export default function CryptoDashboard() {
                   </div>
                 ) : (
                   <div className="divide-y divide-white/[0.04]">
-                    {movers.map((coin, i) => {
-                      const pos = coin.price_change_percentage_24h >= 0;
+                    {movers.map((item, i) => {
+                      const pos = item.changePercent >= 0;
                       return (
                         <div
-                          key={coin.id}
+                          key={item.id}
                           className="flex items-center gap-2.5 px-4 py-2.5 hover:bg-white/[0.02] transition-colors cursor-pointer"
                         >
                           <span className="text-sm text-zinc-700 w-3 shrink-0 tabular-nums">
                             {i + 1}
                           </span>
-                          {/* eslint-disable-next-line @next/next/no-img-element */}
-                          <img
-                            src={coin.image}
-                            alt={coin.name}
-                            className="w-6 h-6 rounded-full shrink-0"
-                          />
+                          {item.image ? (
+                            // eslint-disable-next-line @next/next/no-img-element
+                            <img
+                              src={item.image}
+                              alt={item.name}
+                              className="w-6 h-6 rounded-full shrink-0"
+                            />
+                          ) : (
+                            <div className="w-6 h-6 rounded-full shrink-0 bg-white/10 text-xs font-semibold text-zinc-200 flex items-center justify-center">
+                              {item.symbol.slice(0, 1)}
+                            </div>
+                          )}
                           <div className="flex-1 min-w-0">
                             <div className="flex items-center justify-between">
                               <span className="text-sm font-semibold text-zinc-200 uppercase">
-                                {coin.symbol}
+                                {item.symbol}
                               </span>
                               <span className="text-sm font-semibold tabular-nums">
-                                {fmt(coin.current_price)}
+                                {fmt(item.price)}
                               </span>
                             </div>
                             <div className="flex items-center justify-between mt-0.5">
                               <span className="text-sm text-zinc-600 truncate">
-                                {coin.name}
+                                {item.name}
                               </span>
                               <span
                                 className={`text-sm font-medium tabular-nums flex items-center gap-0.5 ${
@@ -2142,17 +2342,14 @@ export default function CryptoDashboard() {
                                 ) : (
                                   <ArrowDownRight className="w-2.5 h-2.5" />
                                 )}
-                                {Math.abs(
-                                  coin.price_change_percentage_24h,
-                                ).toFixed(2)}
-                                %
+                                {Math.abs(item.changePercent).toFixed(2)}%
                               </span>
                             </div>
                           </div>
-                          {coin.sparkline_in_7d?.price && (
+                          {item.sparkline.length > 0 && (
                             <div className="shrink-0">
                               <Sparkline
-                                data={coin.sparkline_in_7d.price}
+                                data={item.sparkline}
                                 positive={pos}
                                 width={56}
                                 height={28}
@@ -2168,7 +2365,7 @@ export default function CryptoDashboard() {
             </section>
 
             {/* ── AI Chat panel ── */}
-            {showChat && messages.length > 0 && (
+            {isCrypto && showChat && messages.length > 0 && (
               <section className="bg-[#0a0a0a] border border-white/[0.07] rounded-xl overflow-hidden">
                 <div className="flex items-center justify-between px-4 py-2.5 border-b border-white/[0.05]">
                   <div className="flex items-center gap-2">
@@ -2279,112 +2476,116 @@ export default function CryptoDashboard() {
           {/* end left column */}
 
           {/* ── Right sidebar: Prediction Markets ── */}
-          <aside className="w-full lg:w-[300px] lg:shrink-0 lg:sticky lg:top-[57px] lg:self-start">
-            <section>
-              <div className="flex items-center justify-between mb-3">
-                <h2 className="text-sm font-medium text-zinc-500 uppercase tracking-wider">
-                  Prediction Markets
-                </h2>
-                <a
-                  href="https://polymarket.com"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="text-sm text-zinc-600 hover:text-zinc-400 flex items-center gap-1 transition-colors"
-                >
-                  Polymarket
-                  <ExternalLink className="w-2.5 h-2.5" />
-                </a>
-              </div>
-
-              {predictions.length === 0 ? (
-                <div className="bg-[#0a0a0a] border border-white/[0.07] rounded-xl p-8 text-center">
-                  <p className="text-sm text-zinc-600">
-                    Prediction markets unavailable
-                  </p>
+          {isCrypto && (
+            <aside className="w-full lg:w-[300px] lg:shrink-0 lg:sticky lg:top-[57px] lg:self-start">
+              <section>
+                <div className="flex items-center justify-between mb-3">
+                  <h2 className="text-sm font-medium text-zinc-500 uppercase tracking-wider">
+                    Prediction Markets
+                  </h2>
+                  <a
+                    href="https://polymarket.com"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-sm text-zinc-600 hover:text-zinc-400 flex items-center gap-1 transition-colors"
+                  >
+                    Polymarket
+                    <ExternalLink className="w-2.5 h-2.5" />
+                  </a>
                 </div>
-              ) : (
-                <div className="space-y-2.5">
-                  {predictions.map((market) => {
-                    const yesPct = Math.round(
-                      parseFloat(market.outcomePrices?.[0] ?? "0.5") * 100,
-                    );
-                    const isHigh = yesPct >= 50;
-                    const vol = parseFloat(market.volume ?? "0");
 
-                    return (
-                      <a
-                        key={market.id}
-                        href={
-                          market.slug
-                            ? `https://polymarket.com/event/${market.slug}`
-                            : "https://polymarket.com"
-                        }
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="block bg-[#0a0a0a] border border-white/[0.14] rounded-xl p-4 hover:border-white/[0.25] hover:bg-[#111] transition-all cursor-pointer"
-                      >
-                        <p className="text-sm font-medium text-zinc-200 leading-snug mb-3 line-clamp-2">
-                          {market.question}
-                        </p>
-                        <div className="space-y-1.5">
-                          <div className="flex items-center justify-between text-sm">
-                            <div className="flex gap-2">
-                              <span
-                                className={
-                                  isHigh ? "text-emerald-400" : "text-zinc-400"
-                                }
-                              >
-                                Yes{" "}
-                                <span className="font-semibold tabular-nums">
-                                  {yesPct}%
+                {predictions.length === 0 ? (
+                  <div className="bg-[#0a0a0a] border border-white/[0.07] rounded-xl p-8 text-center">
+                    <p className="text-sm text-zinc-600">
+                      Prediction markets unavailable
+                    </p>
+                  </div>
+                ) : (
+                  <div className="space-y-2.5">
+                    {predictions.map((market) => {
+                      const yesPct = Math.round(
+                        parseFloat(market.outcomePrices?.[0] ?? "0.5") * 100,
+                      );
+                      const isHigh = yesPct >= 50;
+                      const vol = parseFloat(market.volume ?? "0");
+
+                      return (
+                        <a
+                          key={market.id}
+                          href={
+                            market.slug
+                              ? `https://polymarket.com/event/${market.slug}`
+                              : "https://polymarket.com"
+                          }
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="block bg-[#0a0a0a] border border-white/[0.14] rounded-xl p-4 hover:border-white/[0.25] hover:bg-[#111] transition-all cursor-pointer"
+                        >
+                          <p className="text-sm font-medium text-zinc-200 leading-snug mb-3 line-clamp-2">
+                            {market.question}
+                          </p>
+                          <div className="space-y-1.5">
+                            <div className="flex items-center justify-between text-sm">
+                              <div className="flex gap-2">
+                                <span
+                                  className={
+                                    isHigh
+                                      ? "text-emerald-400"
+                                      : "text-zinc-400"
+                                  }
+                                >
+                                  Yes{" "}
+                                  <span className="font-semibold tabular-nums">
+                                    {yesPct}%
+                                  </span>
                                 </span>
-                              </span>
-                              <span
-                                className={
-                                  !isHigh ? "text-red-400" : "text-zinc-500"
-                                }
-                              >
-                                No{" "}
-                                <span className="font-semibold tabular-nums">
-                                  {100 - yesPct}%
+                                <span
+                                  className={
+                                    !isHigh ? "text-red-400" : "text-zinc-500"
+                                  }
+                                >
+                                  No{" "}
+                                  <span className="font-semibold tabular-nums">
+                                    {100 - yesPct}%
+                                  </span>
                                 </span>
-                              </span>
+                              </div>
+                            </div>
+                            <div className="h-1.5 bg-white/[0.05] rounded-full overflow-hidden">
+                              <div
+                                className="h-full rounded-full"
+                                style={{
+                                  width: `${yesPct}%`,
+                                  background: isHigh
+                                    ? "linear-gradient(90deg,#22c55e,#16a34a)"
+                                    : "linear-gradient(90deg,#ef4444,#dc2626)",
+                                }}
+                              />
+                            </div>
+                            <div className="flex items-center justify-between text-sm text-zinc-600">
+                              <span>Vol {fmtBig(vol)}</span>
+                              {market.endDate && (
+                                <span>
+                                  {new Date(market.endDate).toLocaleDateString(
+                                    "en-US",
+                                    {
+                                      month: "short",
+                                      day: "numeric",
+                                      year: "2-digit",
+                                    },
+                                  )}
+                                </span>
+                              )}
                             </div>
                           </div>
-                          <div className="h-1.5 bg-white/[0.05] rounded-full overflow-hidden">
-                            <div
-                              className="h-full rounded-full"
-                              style={{
-                                width: `${yesPct}%`,
-                                background: isHigh
-                                  ? "linear-gradient(90deg,#22c55e,#16a34a)"
-                                  : "linear-gradient(90deg,#ef4444,#dc2626)",
-                              }}
-                            />
-                          </div>
-                          <div className="flex items-center justify-between text-sm text-zinc-600">
-                            <span>Vol {fmtBig(vol)}</span>
-                            {market.endDate && (
-                              <span>
-                                {new Date(market.endDate).toLocaleDateString(
-                                  "en-US",
-                                  {
-                                    month: "short",
-                                    day: "numeric",
-                                    year: "2-digit",
-                                  },
-                                )}
-                              </span>
-                            )}
-                          </div>
-                        </div>
-                      </a>
-                    );
-                  })}
-                </div>
-              )}
-            </section>
-          </aside>
+                        </a>
+                      );
+                    })}
+                  </div>
+                )}
+              </section>
+            </aside>
+          )}
         </div>
         {/* end outer flex */}
       </main>

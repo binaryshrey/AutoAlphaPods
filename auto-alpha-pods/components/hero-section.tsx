@@ -87,7 +87,7 @@ export default function HeroSection() {
                 className="absolute inset-0 -z-10 size-full [background:radial-gradient(125%_125%_at_50%_100%,transparent_0%,var(--color-background)_75%)] dark:[background:radial-gradient(125%_125%_at_50%_100%,transparent_0%,#000_75%)]"
               />
 
-              <div className="mx-auto max-w-7xl px-6">
+              <div className="mx-auto max-w-8xl px-6">
                 <div className="text-center sm:mx-auto lg:mr-auto lg:mt-0">
                   <AnimatedGroup variants={transitionVariants}>
                     <Link
@@ -112,14 +112,23 @@ export default function HeroSection() {
                     </Link>
                   </AnimatedGroup>
 
-                  <h1 className="mx-auto mt-8 max-w-4xl text-balance font-bold text-5xl max-md:font-semibold md:text-7xl lg:mt-16 xl:text-[5.25rem] dark:text-white">
+                  <h1 className="mx-auto mt-8 max-w-8xl text-balance font-bold text-5xl max-md:font-semibold md:text-7xl lg:mt-16 xl:text-[5.25rem] dark:text-white">
                     <TextEffect
                       preset="fade-in-blur"
                       speedSegment={0.3}
                       as="span"
                     >
-                      {"Evolve Your Agents, Adapt Your Strategy, "}
+                      {"Scenario-Driven AI Agents,"}
                     </TextEffect>
+                    <br />
+                    <TextEffect
+                      preset="fade-in-blur"
+                      speedSegment={0.3}
+                      as="span"
+                    >
+                      {"Building The Next "}
+                    </TextEffect>
+                    <br />
                     <TextEffect
                       preset="fade-in-blur"
                       delay={0.5}
@@ -127,7 +136,7 @@ export default function HeroSection() {
                       as="span"
                       className="text-emerald-500"
                     >
-                      Dominate the Market.
+                      Generation of Alpha.
                     </TextEffect>
                   </h1>
                   <TextEffect

@@ -185,6 +185,27 @@ interface NewsContextPayload {
   }>;
 }
 
+interface EquityPoint {
+  date: string;
+  equity: number;
+}
+
+interface BacktestResult {
+  prompt: string;
+  tickers: string;
+  generated_code: string;
+  sharpe: number;
+  sortino: number;
+  calmar: number;
+  max_dd: string;
+  cagr: string;
+  win_rate: string;
+  max_streak: number;
+  total_return: string;
+  end_equity: string;
+  equity_curve: EquityPoint[];
+}
+
 interface ChatMessage {
   id: string;
   role: "user" | "assistant";
@@ -192,6 +213,8 @@ interface ChatMessage {
   coinCard?: CoinCardMeta;
   portfolio?: PortfolioData;
   portfolioLoading?: boolean;
+  backtest?: BacktestResult;
+  backtestLoading?: boolean;
   news?: NewsItem[];
   followUps?: string[];
   newsLoading?: boolean;
@@ -251,7 +274,7 @@ const DEFAULT_POSITION_NOTIONAL = 100;
 
 function formatQtyFromNotional(
   price: number,
-  notional = DEFAULT_POSITION_NOTIONAL
+  notional = DEFAULT_POSITION_NOTIONAL,
 ) {
   if (!Number.isFinite(price) || price <= 0) return "1";
   const qty = notional / price;
@@ -265,7 +288,7 @@ function makeMessageId(): string {
 }
 
 function buildPortfolioContext(
-  portfolio?: PortfolioData
+  portfolio?: PortfolioData,
 ): PortfolioContextPayload | undefined {
   if (!portfolio) return undefined;
   return {
@@ -312,15 +335,13 @@ function buildPortfolioContext(
 }
 
 function buildNewsContext(
-  messages: ChatMessage[]
+  messages: ChatMessage[],
 ): NewsContextPayload | undefined {
   const latestNewsMessage = [...messages]
     .reverse()
     .find(
       (m) =>
-        m.role === "assistant" &&
-        Array.isArray(m.news) &&
-        m.news.length > 0
+        m.role === "assistant" && Array.isArray(m.news) && m.news.length > 0,
     );
   if (!latestNewsMessage?.news?.length) return undefined;
   return {
@@ -411,6 +432,119 @@ function SourcesFooter({ raw }: { raw: string }) {
   );
 }
 
+function MetricPill({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs text-zinc-300">
+      <span className="text-zinc-500 uppercase tracking-wide">{label}</span>
+      <span className="text-zinc-100 font-semibold">{value}</span>
+    </div>
+  );
+}
+
+function BacktestCard({ data }: { data: BacktestResult }) {
+  const equitySeries = [
+    {
+      name: "Equity",
+      data: data.equity_curve.map((point) => [
+        new Date(point.date).getTime(),
+        point.equity,
+      ]),
+    },
+  ];
+
+  const options = {
+    chart: {
+      type: "area" as const,
+      toolbar: { show: false },
+      animations: { enabled: false },
+      background: "transparent",
+      sparkline: { enabled: false },
+    },
+    stroke: { curve: "smooth" as const, width: 2 },
+    fill: {
+      type: "gradient" as const,
+      gradient: {
+        shadeIntensity: 1,
+        opacityFrom: 0.3,
+        opacityTo: 0.02,
+        stops: [0, 100],
+      },
+    },
+    colors: ["#22c55e"],
+    grid: {
+      borderColor: "rgba(255,255,255,0.06)",
+      strokeDashArray: 3,
+      padding: { left: 10, right: 10, top: 0, bottom: 0 },
+    },
+    xaxis: {
+      type: "datetime" as const,
+      labels: { style: { colors: "#71717a", fontSize: "10px" } },
+      axisBorder: { show: false },
+      axisTicks: { show: false },
+    },
+    yaxis: {
+      labels: {
+        style: { colors: "#71717a", fontSize: "10px" },
+        formatter: (val: number) => `$${val.toLocaleString("en-US")}`,
+      },
+    },
+    tooltip: {
+      theme: "dark" as const,
+      x: { format: "MMM yyyy" },
+    },
+  };
+
+  return (
+    <div className="rounded-2xl border border-white/10 bg-[#0a0a0a] p-5 space-y-5">
+      <div className="space-y-2">
+        <p className="text-xs uppercase tracking-wider text-zinc-500">
+          Backtest Prompt
+        </p>
+        <p className="text-sm text-zinc-100">{data.prompt}</p>
+        <div className="flex flex-wrap items-center gap-2">
+          <MetricPill label="Tickers" value={data.tickers} />
+          <MetricPill label="End Equity" value={data.end_equity} />
+          <MetricPill label="Total Return" value={data.total_return} />
+        </div>
+      </div>
+
+      <div className="flex flex-wrap gap-2">
+        <MetricPill label="Sharpe" value={data.sharpe.toFixed(2)} />
+        <MetricPill label="Sortino" value={data.sortino.toFixed(2)} />
+        <MetricPill label="Calmar" value={data.calmar.toFixed(2)} />
+        <MetricPill label="Max DD" value={data.max_dd} />
+        <MetricPill label="CAGR" value={data.cagr} />
+        <MetricPill label="Win Rate" value={data.win_rate} />
+        <MetricPill label="Max Streak" value={String(data.max_streak)} />
+      </div>
+
+      <div className="rounded-xl border border-white/10 bg-black/40 p-4">
+        <p className="text-xs uppercase tracking-wider text-zinc-500 mb-2">
+          Generated Code
+        </p>
+        <pre className="text-xs text-zinc-200 overflow-x-auto">
+          <code>{data.generated_code}</code>
+        </pre>
+      </div>
+
+      <div className="rounded-xl border border-white/10 bg-black/40 p-4">
+        <div className="flex items-center justify-between mb-2">
+          <p className="text-xs uppercase tracking-wider text-zinc-500">
+            Equity Curve
+          </p>
+          <span className="text-xs text-zinc-500">Monthly</span>
+        </div>
+        <ReactApexChart
+          type="area"
+          series={equitySeries}
+          options={options}
+          height={220}
+        />
+      </div>
+    </div>
+  );
+}
+
 // ─── Markdown message ─────────────────────────────────────────────────────────
 
 function MarkdownMessage({
@@ -436,7 +570,7 @@ function MarkdownMessage({
           {listItems.map((item, i) => (
             <li key={i}>{renderInline(item)}</li>
           ))}
-        </ul>
+        </ul>,
       );
       listItems = [];
     }
@@ -449,7 +583,7 @@ function MarkdownMessage({
           {orderedItems.map((item, i) => (
             <li key={i}>{renderInline(item)}</li>
           ))}
-        </ol>
+        </ol>,
       );
       orderedItems = [];
     }
@@ -471,21 +605,21 @@ function MarkdownMessage({
           className="text-[13px] font-semibold text-zinc-200 mt-2"
         >
           {renderInline(line.slice(4))}
-        </p>
+        </p>,
       );
     } else if (/^## /.test(line)) {
       flushList();
       blocks.push(
         <p key={blocks.length} className="text-sm font-bold text-white mt-2">
           {renderInline(line.slice(3))}
-        </p>
+        </p>,
       );
     } else if (/^# /.test(line)) {
       flushList();
       blocks.push(
         <p key={blocks.length} className="text-sm font-bold text-white mt-2">
           {renderInline(line.slice(2))}
-        </p>
+        </p>,
       );
     } else if (/^> /.test(line)) {
       flushList();
@@ -495,7 +629,7 @@ function MarkdownMessage({
           className="border-l-2 border-zinc-600 pl-3 text-zinc-400 italic text-sm"
         >
           {renderInline(line.slice(2))}
-        </blockquote>
+        </blockquote>,
       );
     } else if (/^[-*] /.test(line)) {
       if (orderedItems.length) flushList();
@@ -508,9 +642,12 @@ function MarkdownMessage({
     } else {
       flushList();
       blocks.push(
-        <p key={blocks.length} className="text-sm text-zinc-300 leading-relaxed">
+        <p
+          key={blocks.length}
+          className="text-sm text-zinc-300 leading-relaxed"
+        >
           {renderInline(line)}
-        </p>
+        </p>,
       );
     }
   }
@@ -697,14 +834,15 @@ function CoinDetailCard({ meta }: { meta: CoinCardMeta }) {
   const assetType = meta.assetType;
   const [range, setRange] = useState(meta.range);
   const [localDetail, setLocalDetail] = useState<CoinDetail | undefined>(
-    undefined
+    undefined,
   );
   const detail = localDetail ?? meta.data;
   const [loadingRange, setLoadingRange] = useState(false);
   const [showTradeWidget, setShowTradeWidget] = useState(false);
   const [checkingConfig, setCheckingConfig] = useState(false);
-  const [alpacaConfig, setAlpacaConfig] =
-    useState<AlpacaConfigResponse | null>(null);
+  const [alpacaConfig, setAlpacaConfig] = useState<AlpacaConfigResponse | null>(
+    null,
+  );
   const [orderSide, setOrderSide] = useState<AlpacaOrderSide>("buy");
   const [orderType, setOrderType] = useState<AlpacaOrderType>("market");
   const [timeInForce, setTimeInForce] = useState<AlpacaTimeInForce>("gtc");
@@ -721,7 +859,7 @@ function CoinDetailCard({ meta }: { meta: CoinCardMeta }) {
   const [submittingOrder, setSubmittingOrder] = useState(false);
   const [tradeError, setTradeError] = useState<string | null>(null);
   const [placedOrder, setPlacedOrder] = useState<AlpacaPlacedOrder | null>(
-    null
+    null,
   );
   const detailSymbol = detail?.symbol;
   const detailPrice = detail?.current_price;
@@ -731,11 +869,11 @@ function CoinDetailCard({ meta }: { meta: CoinCardMeta }) {
     setTradeSymbol(
       assetType === "crypto"
         ? `${detailSymbol.toUpperCase()}USD`
-        : detailSymbol.toUpperCase()
+        : detailSymbol.toUpperCase(),
     );
     setQuantity(formatQtyFromNotional(detailPrice));
     setLimitPrice(
-      detailPrice >= 1 ? detailPrice.toFixed(2) : detailPrice.toFixed(6)
+      detailPrice >= 1 ? detailPrice.toFixed(2) : detailPrice.toFixed(6),
     );
     setOrderSide("buy");
   }, [assetType, showTradeWidget, detailPrice, detailSymbol]);
@@ -756,14 +894,15 @@ function CoinDetailCard({ meta }: { meta: CoinCardMeta }) {
     }
     setLoadingRange(true);
     try {
-      if (assetType === "crypto" && !meta.coinId) throw new Error("coinId missing");
+      if (assetType === "crypto" && !meta.coinId)
+        throw new Error("coinId missing");
       const res =
         assetType === "crypto"
           ? await fetch(`/api/coin-detail?coinId=${meta.coinId}&range=${r}`)
           : await fetch(
               `/api/equity-detail?symbol=${encodeURIComponent(
-                detail?.symbol || meta.symbol
-              )}&range=${r}`
+                detail?.symbol || meta.symbol,
+              )}&range=${r}`,
             );
       if (!res.ok) throw new Error(`${res.status}`);
       const d: CoinDetail = await res.json();
@@ -997,7 +1136,7 @@ function CoinDetailCard({ meta }: { meta: CoinCardMeta }) {
             assetType === "crypto"
               ? "https://www.coingecko.com"
               : `https://finance.yahoo.com/quote/${encodeURIComponent(
-                  detail.symbol
+                  detail.symbol,
                 )}`
           }
           target="_blank"
@@ -1157,7 +1296,9 @@ function CoinDetailCard({ meta }: { meta: CoinCardMeta }) {
                   <div className="rounded-md border border-emerald-500/30 bg-emerald-500/10 px-2 py-1.5 text-[10px] text-emerald-300 space-y-0.5">
                     <p>
                       Order submitted:{" "}
-                      <span className="font-semibold">{placedOrder.symbol}</span>
+                      <span className="font-semibold">
+                        {placedOrder.symbol}
+                      </span>
                     </p>
                     <p>
                       {placedOrder.side.toUpperCase()} {placedOrder.qty} ·{" "}
@@ -1206,8 +1347,7 @@ function PortfolioCard({ data }: { data: PortfolioData }) {
             </p>
           </div>
           <span className="text-[10px] text-zinc-500">
-            {data.account.status || "active"} ·{" "}
-            {data.account.currency || "USD"}
+            {data.account.status || "active"} · {data.account.currency || "USD"}
           </span>
         </div>
       </div>
@@ -1268,7 +1408,8 @@ function PortfolioCard({ data }: { data: PortfolioData }) {
                       {p.symbol}
                     </p>
                     <p className="text-[10px] text-zinc-500">
-                      Qty {p.qty} · Avg ${Number(p.avg_entry_price || 0).toFixed(2)}
+                      Qty {p.qty} · Avg $
+                      {Number(p.avg_entry_price || 0).toFixed(2)}
                     </p>
                   </div>
                   <div className="text-right">
@@ -1334,14 +1475,16 @@ export default function ChatPageContent() {
   useEffect(() => {
     fetch("/api/sentiment")
       .then((r) => r.json())
-      .then((data) => { if (data?.tone) setSentiment(data); })
+      .then((data) => {
+        if (data?.tone) setSentiment(data);
+      })
       .catch(() => {});
   }, []);
 
   // Fetch market data for sidebar
   useEffect(() => {
     fetch(
-      "/api/crypto?endpoint=coins/markets&vs_currency=usd&order=market_cap_desc&per_page=10&page=1&sparkline=true&price_change_percentage=24h"
+      "/api/crypto?endpoint=coins/markets&vs_currency=usd&order=market_cap_desc&per_page=10&page=1&sparkline=true&price_change_percentage=24h",
     )
       .then((r) => r.json())
       .then((data) => {
@@ -1360,10 +1503,10 @@ export default function ChatPageContent() {
   const updateMessage = useCallback(
     (messageId: string, updater: (prev: ChatMessage) => ChatMessage) => {
       setMessages((prev) =>
-        prev.map((msg) => (msg.id === messageId ? updater(msg) : msg))
+        prev.map((msg) => (msg.id === messageId ? updater(msg) : msg)),
       );
     },
-    []
+    [],
   );
 
   const enrichAssistantMessage = useCallback(
@@ -1381,9 +1524,7 @@ export default function ChatPageContent() {
       const newsQuery = coinName || coinSymbol || userText;
       updateMessage(messageId, (prev) => ({ ...prev, newsLoading: true }));
       try {
-        const res = await fetch(
-          `/api/news?q=${encodeURIComponent(newsQuery)}`
-        );
+        const res = await fetch(`/api/news?q=${encodeURIComponent(newsQuery)}`);
         const payload = (await res.json()) as {
           items?: NewsItem[];
           followUps?: string[];
@@ -1398,19 +1539,13 @@ export default function ChatPageContent() {
         updateMessage(messageId, (prev) => ({ ...prev, newsLoading: false }));
       }
     },
-    [updateMessage]
+    [updateMessage],
   );
 
   const sendPrompt = useCallback(
     async (rawPrompt: string) => {
       const text = rawPrompt.trim();
       if (!text || streaming) return;
-      const latestPortfolio = [...messages]
-        .reverse()
-        .find((m) => m.portfolio)?.portfolio;
-      const portfolioContext = buildPortfolioContext(latestPortfolio);
-      const newsContext = buildNewsContext(messages);
-
       setQuery("");
       setStreaming(true);
 
@@ -1420,224 +1555,51 @@ export default function ChatPageContent() {
       setMessages((prev) => [
         ...prev,
         { id: userId, role: "user", content: text },
-        { id: assistantId, role: "assistant", content: "" },
+        {
+          id: assistantId,
+          role: "assistant",
+          content: "",
+          backtestLoading: true,
+        },
       ]);
 
       try {
-        const res = await fetch("/api/chat", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ message: text, portfolioContext, newsContext }),
-        });
-        if (!res.body) throw new Error("No body");
+        const res = await fetch(
+          "https://autoalphapods-1.onrender.com/backtest/sphinx",
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              prompt: text,
+              start: "2015-01-01",
+              end: "2024-12-31",
+              initial_cash: 100000,
+            }),
+          },
+        );
 
-        const reader = res.body.getReader();
-        const dec = new TextDecoder();
-        let accumulated = "";
-        let cardMode: "asset" | "portfolio" | null = null;
+        if (!res.ok) throw new Error(`Backtest ${res.status}`);
+        const payload = (await res.json()) as BacktestResult;
 
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          const chunk = dec.decode(value);
-          accumulated += chunk;
-
-          if (
-            accumulated.startsWith("__ASSET_CARD__") ||
-            accumulated.startsWith("__COIN_CARD__")
-          ) {
-            if (!cardMode) {
-              cardMode = "asset";
-              updateMessage(assistantId, (prev) => ({
-                ...prev,
-                role: "assistant",
-                content: "__ASSET_CARD__",
-                coinCard: {
-                  assetType: "crypto",
-                  coinId: undefined,
-                  symbol: "",
-                  name: "",
-                  range: "1D",
-                  loading: true,
-                },
-              }));
-            }
-          } else if (accumulated.startsWith("__PORTFOLIO_CARD__")) {
-            if (!cardMode) {
-              cardMode = "portfolio";
-              updateMessage(assistantId, (prev) => ({
-                ...prev,
-                role: "assistant",
-                content: "__PORTFOLIO_CARD__",
-                portfolio: undefined,
-                portfolioLoading: true,
-              }));
-            }
-          } else if (!accumulated.startsWith("_")) {
-            updateMessage(assistantId, (prev) => ({
-              ...prev,
-              role: "assistant",
-              content: accumulated,
-            }));
-          }
-        }
-
-        if (cardMode === "asset") {
-          try {
-            const match = accumulated.match(
-              /__(?:ASSET|COIN)_CARD__\s*(\{[^}]+\})\s*([\s\S]*)/
-            );
-            if (!match) throw new Error("No JSON found in asset card response");
-            const parsed = JSON.parse(match[1]) as {
-              assetType?: "crypto" | "equity";
-              coinId?: string;
-              symbol: string;
-              name: string;
-              buyIntent?: boolean;
-            };
-            const assetType =
-              parsed.assetType === "equity" ? "equity" : "crypto";
-            const commentary = match[2].trim();
-            const symbol = (parsed.symbol || "").trim().toUpperCase();
-            const name = (parsed.name || "").trim() || symbol;
-            const buyIntent = parsed.buyIntent;
-            let coinId = parsed.coinId;
-            let detail: CoinDetail;
-
-            if (assetType === "crypto") {
-              // Check local coins cache first
-              const cached = coins.find(
-                (c) =>
-                  c.id === coinId ||
-                  c.symbol.toUpperCase() === symbol ||
-                  c.name.toLowerCase() === name.toLowerCase()
-              );
-              if (cached) {
-                const sparkline = cached.sparkline_in_7d?.price ?? [];
-                const now = Date.now();
-                const step =
-                  sparkline.length > 1
-                    ? (7 * 24 * 3600 * 1000) / (sparkline.length - 1)
-                    : 3600 * 1000;
-                detail = {
-                  id: cached.id,
-                  name: cached.name,
-                  symbol: cached.symbol.toUpperCase(),
-                  image: cached.image,
-                  current_price: cached.current_price,
-                  price_change_24h: cached.price_change_24h,
-                  price_change_percentage_24h:
-                    cached.price_change_percentage_24h,
-                  market_cap: cached.market_cap,
-                  total_volume: cached.total_volume,
-                  high_24h: cached.high_24h,
-                  low_24h: cached.low_24h,
-                  ath: 0,
-                  atl: 0,
-                  last_updated: new Date().toISOString(),
-                  prices: sparkline.map(
-                    (p, i) =>
-                      [now - (sparkline.length - 1 - i) * step, p] as [
-                        number,
-                        number
-                      ]
-                  ),
-                  asset_type: "crypto",
-                };
-                coinId = cached.id;
-              } else {
-                const resolvedCoinId = coinId || symbol.toLowerCase();
-                const detailRes = await fetch(
-                  `/api/coin-detail?coinId=${encodeURIComponent(resolvedCoinId)}`
-                );
-                if (!detailRes.ok)
-                  throw new Error("Failed to load crypto detail");
-                detail = (await detailRes.json()) as CoinDetail;
-                coinId = detail.id || resolvedCoinId;
-              }
-            } else {
-              const detailRes = await fetch(
-                `/api/equity-detail?symbol=${encodeURIComponent(symbol)}`
-              );
-              detail = (await detailRes.json()) as CoinDetail;
-              if (!detailRes.ok)
-                throw new Error("Failed to load equity detail");
-            }
-
-            updateMessage(assistantId, (prev) => ({
-              ...prev,
-              role: "assistant",
-              content: commentary || "__ASSET_CARD__",
-              coinCard: {
-                assetType,
-                coinId,
-                symbol,
-                name,
-                range: "1W",
-                loading: false,
-                data: detail,
-                buyIntent,
-              },
-            }));
-            void enrichAssistantMessage({
-              messageId: assistantId,
-              userText: text,
-              coinName: name,
-              coinSymbol: symbol,
-            });
-          } catch {
-            updateMessage(assistantId, (prev) => ({
-              ...prev,
-              role: "assistant",
-              content: "Could not load coin data. Please try again.",
-            }));
-          }
-        } else if (cardMode === "portfolio") {
-          try {
-            const match = accumulated.match(
-              /__PORTFOLIO_CARD__\s*(\{[^]*\})?\s*([\s\S]*)/
-            );
-            const commentary = match?.[2]?.trim() || "";
-            const portfolioRes = await fetch("/api/alpaca/portfolio");
-            if (!portfolioRes.ok) throw new Error("Failed to load portfolio.");
-            const portfolioData =
-              (await portfolioRes.json()) as PortfolioData;
-            updateMessage(assistantId, (prev) => ({
-              ...prev,
-              role: "assistant",
-              content: commentary || "__PORTFOLIO_CARD__",
-              portfolio: portfolioData,
-              portfolioLoading: false,
-            }));
-            const firstSymbol = portfolioData.positions?.[0]?.symbol;
-            void enrichAssistantMessage({
-              messageId: assistantId,
-              userText: text,
-              coinSymbol: firstSymbol,
-            });
-          } catch {
-            updateMessage(assistantId, (prev) => ({
-              ...prev,
-              role: "assistant",
-              content:
-                "I couldn't load your portfolio right now. Please try again.",
-              portfolioLoading: false,
-            }));
-          }
-        } else {
-          void enrichAssistantMessage({ messageId: assistantId, userText: text });
-        }
+        updateMessage(assistantId, (prev) => ({
+          ...prev,
+          role: "assistant",
+          content: "",
+          backtest: payload,
+          backtestLoading: false,
+        }));
       } catch {
         updateMessage(assistantId, (prev) => ({
           ...prev,
           role: "assistant",
-          content: "Sorry, I couldn't process your request. Please try again.",
+          content: "Sorry, I couldn't run that backtest. Please try again.",
+          backtestLoading: false,
         }));
       } finally {
         setStreaming(false);
       }
     },
-    [coins, enrichAssistantMessage, messages, streaming, updateMessage]
+    [messages, streaming, updateMessage],
   );
 
   // Auto-send the initial query from URL params
@@ -1667,7 +1629,7 @@ export default function ChatPageContent() {
               <ArrowLeft className="w-3.5 h-3.5" />
             </Link>
             <span className="text-xl font-semibold tracking-tight">
-              False<span className="text-zinc-400">Markets</span>
+              AutoAlpha<span className="text-zinc-400">Pods</span>
             </span>
           </div>
           <div className="flex items-center gap-4">
@@ -1679,23 +1641,25 @@ export default function ChatPageContent() {
                 className="flex items-center gap-2.5 hover:opacity-80 transition-opacity cursor-pointer"
               >
                 <div className="flex items-end gap-[3px] h-7">
-                  {[7, 12, 10, 19, 15, 22, 14, 18, 11, 16, 8, 14].map((h, i) => (
-                    <span
-                      key={i}
-                      className="w-[3px] rounded-full"
-                      style={{
-                        height: `${h}px`,
-                        background:
-                          sentiment.tone === "bearish"
-                            ? "#fb7185"
-                            : sentiment.tone === "bullish"
-                            ? "#34d399"
-                            : "#fbbf24",
-                        opacity: 0.55 + (i % 3) * 0.15,
-                        animation: `eqBar ${0.8 + (i % 4) * 0.15}s ease-in-out ${i * 0.07}s infinite alternate`,
-                      }}
-                    />
-                  ))}
+                  {[7, 12, 10, 19, 15, 22, 14, 18, 11, 16, 8, 14].map(
+                    (h, i) => (
+                      <span
+                        key={i}
+                        className="w-[3px] rounded-full"
+                        style={{
+                          height: `${h}px`,
+                          background:
+                            sentiment.tone === "bearish"
+                              ? "#fb7185"
+                              : sentiment.tone === "bullish"
+                                ? "#34d399"
+                                : "#fbbf24",
+                          opacity: 0.55 + (i % 3) * 0.15,
+                          animation: `eqBar ${0.8 + (i % 4) * 0.15}s ease-in-out ${i * 0.07}s infinite alternate`,
+                        }}
+                      />
+                    ),
+                  )}
                 </div>
                 <div className="flex flex-col leading-none gap-1">
                   <span
@@ -1705,8 +1669,8 @@ export default function ChatPageContent() {
                         sentiment.tone === "bearish"
                           ? "#fb7185"
                           : sentiment.tone === "bullish"
-                          ? "#34d399"
-                          : "#fbbf24",
+                            ? "#34d399"
+                            : "#fbbf24",
                     }}
                   >
                     {sentiment.label}
@@ -1717,7 +1681,8 @@ export default function ChatPageContent() {
                       month: "short",
                       day: "numeric",
                       year: "numeric",
-                    })}{", "}EST
+                    })}
+                    {", "}EST
                   </span>
                 </div>
               </a>
@@ -1764,7 +1729,20 @@ export default function ChatPageContent() {
                     <Zap className="w-3 h-3 text-blue-400" />
                   </div>
                   <div className="flex-1 min-w-0">
-                    {msg.coinCard ? (
+                    {msg.backtest || msg.backtestLoading ? (
+                      <div className="space-y-3">
+                        {msg.backtest ? (
+                          <BacktestCard data={msg.backtest} />
+                        ) : (
+                          <div className="bg-[#0a0a0a] border border-white/[0.07] rounded-xl p-6 flex items-center gap-3">
+                            <RefreshCw className="w-4 h-4 animate-spin text-zinc-500" />
+                            <span className="text-xs text-zinc-500">
+                              Running backtest…
+                            </span>
+                          </div>
+                        )}
+                      </div>
+                    ) : msg.coinCard ? (
                       <div className="space-y-3">
                         <CoinDetailCard meta={msg.coinCard} />
                         {!msg.coinCard.loading &&
@@ -1793,12 +1771,13 @@ export default function ChatPageContent() {
                             </span>
                           </div>
                         )}
-                        {msg.content && msg.content !== "__PORTFOLIO_CARD__" && (
-                          <MarkdownMessage
-                            text={msg.content}
-                            streaming={false}
-                          />
-                        )}
+                        {msg.content &&
+                          msg.content !== "__PORTFOLIO_CARD__" && (
+                            <MarkdownMessage
+                              text={msg.content}
+                              streaming={false}
+                            />
+                          )}
                         <MessageContext
                           message={msg}
                           disabled={streaming}
@@ -1809,9 +1788,7 @@ export default function ChatPageContent() {
                       <div>
                         <MarkdownMessage
                           text={msg.content}
-                          streaming={
-                            streaming && idx === messages.length - 1
-                          }
+                          streaming={streaming && idx === messages.length - 1}
                         />
                         <MessageContext
                           message={msg}
@@ -1848,7 +1825,13 @@ export default function ChatPageContent() {
                   return (
                     <div
                       key={coin.id}
-                      onClick={() => window.open(`https://www.coingecko.com/en/coins/${coin.id}`, "_blank", "noopener,noreferrer")}
+                      onClick={() =>
+                        window.open(
+                          `https://www.coingecko.com/en/coins/${coin.id}`,
+                          "_blank",
+                          "noopener,noreferrer",
+                        )
+                      }
                       className="bg-[#0a0a0a] border border-white/[0.07] rounded-xl hover:border-white/[0.14] hover:bg-[#111] transition-all overflow-hidden cursor-pointer"
                     >
                       <div className="px-3.5 pt-3 pb-1.5">
@@ -1883,7 +1866,7 @@ export default function ChatPageContent() {
                                 <ArrowDownRight className="w-3 h-3" />
                               )}
                               {Math.abs(
-                                coin.price_change_percentage_24h
+                                coin.price_change_percentage_24h,
                               ).toFixed(2)}
                               %
                             </span>
