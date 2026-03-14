@@ -23,7 +23,7 @@ from pydantic import BaseModel
 from supabase import create_client
 
 warnings.filterwarnings("ignore")
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("uvicorn.error")
 
 from dotenv import load_dotenv
 import os
@@ -458,11 +458,19 @@ def _extract_code_from_notebook(notebook_path: Path) -> str:
 
 
 def _log_sphinx_logs(notebook_path: Path, stdout: str, stderr: str) -> None:
-    logger.info("Sphinx notebook: %s", notebook_path)
+    messages: list[tuple[str, str]] = [("info", f"Sphinx notebook: {notebook_path}")]
     if stdout.strip():
-        logger.info("Sphinx stdout:\n%s", stdout.strip())
+        messages.append(("info", f"Sphinx stdout:\n{stdout.strip()}"))
     if stderr.strip():
-        logger.warning("Sphinx stderr:\n%s", stderr.strip())
+        messages.append(("warning", f"Sphinx stderr:\n{stderr.strip()}"))
+
+    if logger.handlers:
+        for level, message in messages:
+            getattr(logger, level)(message)
+        return
+
+    for _, message in messages:
+        print(message, flush=True)
 
 
 def _build_sphinx_env() -> dict:
