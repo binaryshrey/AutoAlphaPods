@@ -901,13 +901,12 @@ def _run_single_backtest_sphinx(
     signals = _execute_strategy(code, macro, prices)
 
     _stream_log(stream_log, "Simulating portfolio.", stage="simulate_portfolio")
-    port_returns, equity = _simulate_portfolio(signals, prices, initial_cash)
+    port_returns, equity, weights, px = _simulate_portfolio(signals, prices, initial_cash)
     _stream_log(stream_log, "Computing metrics.", stage="compute_metrics")
     metrics = _compute_metrics(
         port_returns,
         equity,
         weights,
-        aligned_prices,
         prompt,
         tickers=signals.columns.tolist(),
         code=code,
