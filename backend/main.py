@@ -158,6 +158,7 @@ Hard rules:
 3. Use .shift(1) on ALL signals to prevent look-ahead bias
 4. Handle NaN with .fillna(0)
 5. Return a DataFrame, never a Series
+6. Since the strategy uses daily time series, the positions are also expected on a daily granularity
 """
 
 SPHINX_OUTPUT_CODE_BLOCK = re.compile(r"```(?:python)?\s*(.*?)```", re.DOTALL)
