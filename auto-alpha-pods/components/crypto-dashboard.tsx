@@ -3,6 +3,17 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import dynamic from "next/dynamic";
+import {
+  Chart as ChartJS,
+  LineElement,
+  PointElement,
+  LinearScale,
+  CategoryScale,
+  Filler,
+  Tooltip,
+  Legend,
+} from "chart.js";
+import { Line } from "react-chartjs-2";
 import TradingDashboardModal from "@/components/trading-dashboard-modal";
 import {
   Search,
@@ -26,6 +37,16 @@ const ReactApexChart = dynamic(() => import("react-apexcharts"), {
   ssr: false,
   loading: () => <div className="w-20 h-9" />,
 });
+
+ChartJS.register(
+  LineElement,
+  PointElement,
+  LinearScale,
+  CategoryScale,
+  Filler,
+  Tooltip,
+  Legend,
+);
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -136,6 +157,96 @@ interface CommodityStripItem {
 }
 
 interface CommodityNewsItem {
+  title: string;
+  link: string;
+  tag: string;
+  publisher: string;
+  timeAgo: string;
+}
+
+interface FixedIncomeCard {
+  id: string;
+  tenor: string;
+  name: string;
+  yield: number;
+  changeBps: number;
+  sparkline: number[];
+}
+
+interface FixedIncomeCurve {
+  tenors: string[];
+  today: number[];
+  yesterday: number[];
+}
+
+interface FixedIncomeSpread {
+  id: string;
+  label: string;
+  value: number;
+  unit: string;
+  changeBps: number;
+  signal: string;
+}
+
+interface FixedIncomeStripItem {
+  id: string;
+  label: string;
+  value: number;
+  unit: string;
+  changeBps: number;
+}
+
+interface FixedIncomeNewsItem {
+  title: string;
+  link: string;
+  tag: string;
+  publisher: string;
+  timeAgo: string;
+}
+
+interface EquityCard {
+  id: string;
+  symbol: string;
+  name: string;
+  price: number;
+  changePercent: number;
+  changeAbs: number;
+  sparkline: number[];
+  volume: number;
+}
+
+interface EquitySector {
+  symbol: string;
+  name: string;
+  changePercent: number;
+}
+
+interface EquityIndicator {
+  id: string;
+  label: string;
+  value: number;
+  unit: string;
+  change: number;
+  signal: string;
+}
+
+interface EquityStripItem {
+  label: string;
+  value: number;
+  change: number;
+  unit: string;
+}
+
+interface EquityEarningRow {
+  symbol: string;
+  name: string;
+  epsEst: number;
+  epsAct: number;
+  beat: boolean;
+  timing: string;
+}
+
+interface EquityNewsItem {
   title: string;
   link: string;
   tag: string;
@@ -304,6 +415,18 @@ function pct(n: number): string {
   return `${n >= 0 ? "+" : ""}${n.toFixed(2)}%`;
 }
 
+function fmtYield(value: number): string {
+  return `${value.toFixed(2)}%`;
+}
+
+function fmtBps(value: number): string {
+  const sign = value >= 0 ? "+" : "-";
+  return `${sign}${Math.abs(value).toFixed(1)} bps`;
+}
+
+const EQUITY_UP = "#27ae60";
+const EQUITY_DOWN = "#c0392b";
+
 const DEFAULT_POSITION_NOTIONAL = 100;
 
 const ASSET_TABS = [
@@ -417,13 +540,15 @@ function Sparkline({
   positive,
   width = 80,
   height = 36,
+  colorOverride,
 }: {
   data: number[];
   positive: boolean;
   width?: number;
   height?: number;
+  colorOverride?: string;
 }) {
-  const color = positive ? "#22c55e" : "#ef4444";
+  const color = colorOverride || (positive ? "#22c55e" : "#ef4444");
   const series = [{ data: data.filter(Boolean).slice(-30) }];
   const options = {
     chart: {
@@ -471,13 +596,17 @@ function MiniSparkline({
   positive,
   width = 96,
   height = 40,
+  colorOverride,
+  fillOpacity = 0.12,
 }: {
   data: number[];
   positive: boolean;
   width?: number;
   height?: number;
+  colorOverride?: string;
+  fillOpacity?: number;
 }) {
-  const color = positive ? "#22c55e" : "#ef4444";
+  const color = colorOverride || (positive ? "#22c55e" : "#ef4444");
   const path = buildSparklinePath(data, width, height);
 
   if (!path) return <div style={{ width, height }} />;
@@ -492,7 +621,7 @@ function MiniSparkline({
       <path
         d={`${path} L ${width} ${height} L 0 ${height} Z`}
         fill={color}
-        opacity={0.12}
+        opacity={fillOpacity}
       />
       <path d={path} fill="none" stroke={color} strokeWidth={1.6} />
     </svg>
@@ -505,12 +634,16 @@ function CardSparkline({
   data,
   positive,
   height = 52,
+  colorOverride,
+  useGradient = true,
 }: {
   data: number[];
   positive: boolean;
   height?: number;
+  colorOverride?: string;
+  useGradient?: boolean;
 }) {
-  const color = positive ? "#22c55e" : "#ef4444";
+  const color = colorOverride || (positive ? "#22c55e" : "#ef4444");
   const filtered = data.filter(Boolean).slice(-40);
 
   const series = [{ data: filtered }];
@@ -522,19 +655,21 @@ function CardSparkline({
       background: "transparent",
     },
     stroke: { curve: "smooth" as const, width: 1.5 },
-    fill: {
-      type: "gradient",
-      gradient: {
-        shadeIntensity: 1,
-        opacityFrom: 0.25,
-        opacityTo: 0.02,
-        stops: [0, 100],
-        colorStops: [
-          { offset: 0, color, opacity: 0.25 },
-          { offset: 100, color, opacity: 0.02 },
-        ],
-      },
-    },
+    fill: useGradient
+      ? {
+          type: "gradient",
+          gradient: {
+            shadeIntensity: 1,
+            opacityFrom: 0.25,
+            opacityTo: 0.02,
+            stops: [0, 100],
+            colorStops: [
+              { offset: 0, color, opacity: 0.25 },
+              { offset: 100, color, opacity: 0.02 },
+            ],
+          },
+        }
+      : { type: "solid", opacity: 0.12 },
     tooltip: { enabled: false },
     colors: [color],
     grid: { show: false },
@@ -551,6 +686,65 @@ function CardSparkline({
       height={height}
     />
   );
+}
+
+function YieldCurveChart({
+  tenors,
+  today,
+  yesterday,
+}: {
+  tenors: string[];
+  today: number[];
+  yesterday: number[];
+}) {
+  const data = {
+    labels: tenors,
+    datasets: [
+      {
+        label: "Today",
+        data: today,
+        borderColor: "#38bdf8",
+        backgroundColor: "rgba(56,189,248,0.15)",
+        borderWidth: 2,
+        pointRadius: 2,
+        tension: 0.35,
+      },
+      {
+        label: "Yesterday",
+        data: yesterday,
+        borderColor: "#52525b",
+        borderDash: [6, 4],
+        borderWidth: 2,
+        pointRadius: 0,
+        tension: 0.35,
+      },
+    ],
+  };
+
+  const options = {
+    responsive: true,
+    maintainAspectRatio: false,
+    plugins: {
+      legend: { display: false },
+      tooltip: { enabled: true },
+    },
+    scales: {
+      x: {
+        grid: { display: false },
+        ticks: { color: "#71717a", font: { size: 11 } },
+      },
+      y: {
+        grid: { color: "rgba(255,255,255,0.06)" },
+        ticks: {
+          color: "#71717a",
+          font: { size: 11 },
+          callback: (value: number | string) => `${value}%`,
+        },
+      },
+    },
+  };
+
+  return <Line data={data} options={options} />;
 }
 
 // ─── Markdown renderer ────────────────────────────────────────────────────────
@@ -1650,6 +1844,8 @@ export default function CryptoDashboard() {
   const activeAsset = normalizeAssetTab(searchParams.get("asset"));
   const isCrypto = activeAsset === "crypto";
   const isCommodity = activeAsset === "commodity";
+  const isFixedIncome = activeAsset === "fixed-income";
+  const isEquity = activeAsset === "equity";
   const [coins, setCoins] = useState<CoinData[]>([]);
   const [globalData, setGlobalData] = useState<GlobalData | null>(null);
   const [assetItems, setAssetItems] = useState<MarketItem[]>([]);
@@ -1661,6 +1857,34 @@ export default function CryptoDashboard() {
   );
   const [commodityNews, setCommodityNews] = useState<CommodityNewsItem[]>([]);
   const [commodityNewsLoading, setCommodityNewsLoading] = useState(false);
+  const [fixedIncomeCards, setFixedIncomeCards] = useState<FixedIncomeCard[]>(
+    [],
+  );
+  const [fixedIncomeCurve, setFixedIncomeCurve] =
+    useState<FixedIncomeCurve | null>(null);
+  const [fixedIncomeSpreads, setFixedIncomeSpreads] = useState<
+    FixedIncomeSpread[]
+  >([]);
+  const [fixedIncomeStrip, setFixedIncomeStrip] = useState<
+    FixedIncomeStripItem[]
+  >([]);
+  const [fixedIncomeNews, setFixedIncomeNews] = useState<FixedIncomeNewsItem[]>(
+    [],
+  );
+  const [fixedIncomeMoverTab, setFixedIncomeMoverTab] = useState<
+    "rising" | "falling"
+  >("rising");
+  const [equityCards, setEquityCards] = useState<EquityCard[]>([]);
+  const [equitySectors, setEquitySectors] = useState<EquitySector[]>([]);
+  const [equityIndicators, setEquityIndicators] = useState<EquityIndicator[]>(
+    [],
+  );
+  const [equityStrip, setEquityStrip] = useState<EquityStripItem[]>([]);
+  const [equityEarnings, setEquityEarnings] = useState<EquityEarningRow[]>([]);
+  const [equityNews, setEquityNews] = useState<EquityNewsItem[]>([]);
+  const [equityMoverTab, setEquityMoverTab] = useState<
+    "gainers" | "losers" | "volume"
+  >("gainers");
   const [predictions, setPredictions] = useState<PredictionMarket[]>([]);
   const [sentiment, setSentiment] = useState<SentimentData | null>(null);
   const [loading, setLoading] = useState(true);
@@ -1729,7 +1953,136 @@ export default function CryptoDashboard() {
       else setAssetRefreshing(true);
 
       try {
-        if (activeAsset === "commodity") {
+        if (activeAsset === "fixed-income") {
+          const res = await fetch("/api/fixed-income");
+          if (!res.ok) throw new Error(`${res.status}`);
+          const payload = (await res.json()) as {
+            cards?: FixedIncomeCard[];
+            curve?: FixedIncomeCurve;
+            spreads?: FixedIncomeSpread[];
+            strip?: FixedIncomeStripItem[];
+            news?: FixedIncomeNewsItem[];
+          };
+          const cards = Array.isArray(payload.cards)
+            ? payload.cards.map((item: any) => ({
+                id: String(item.id ?? item.tenor ?? ""),
+                tenor: String(item.tenor ?? ""),
+                name: String(item.name ?? ""),
+                yield: Number(item.yield ?? 0),
+                changeBps: Number(item.change_bps ?? item.changeBps ?? 0),
+                sparkline: Array.isArray(item.sparkline) ? item.sparkline : [],
+              }))
+            : [];
+          setFixedIncomeCards(cards);
+          setFixedIncomeCurve(payload.curve ?? null);
+          const spreads = Array.isArray(payload.spreads)
+            ? payload.spreads.map((item: any) => ({
+                id: String(item.id ?? ""),
+                label: String(item.label ?? ""),
+                value: Number(item.value ?? 0),
+                unit: String(item.unit ?? ""),
+                changeBps: Number(item.change_bps ?? item.changeBps ?? 0),
+                signal: String(item.signal ?? ""),
+              }))
+            : [];
+          setFixedIncomeSpreads(spreads);
+          const strip = Array.isArray(payload.strip)
+            ? payload.strip.map((item: any) => ({
+                id: String(item.id ?? ""),
+                label: String(item.label ?? ""),
+                value: Number(item.value ?? 0),
+                unit: String(item.unit ?? ""),
+                changeBps: Number(item.change_bps ?? item.changeBps ?? 0),
+              }))
+            : [];
+          setFixedIncomeStrip(strip);
+          setFixedIncomeNews(Array.isArray(payload.news) ? payload.news : []);
+          setAssetItems([]);
+          setCommodityItems([]);
+          setCommodityStrip([]);
+          setEquityCards([]);
+          setEquitySectors([]);
+          setEquityIndicators([]);
+          setEquityStrip([]);
+          setEquityEarnings([]);
+          setEquityNews([]);
+        } else if (activeAsset === "equity") {
+          const res = await fetch("/api/equity-dashboard");
+          if (!res.ok) throw new Error(`${res.status}`);
+          const payload = (await res.json()) as {
+            cards?: any[];
+            sectors?: any[];
+            indicators?: any[];
+            strip?: any[];
+            earnings?: any[];
+            news?: any[];
+          };
+          const cards = Array.isArray(payload.cards)
+            ? payload.cards.map((item) => ({
+                id: String(item.id ?? item.symbol ?? ""),
+                symbol: String(item.symbol ?? ""),
+                name: String(item.name ?? ""),
+                price: Number(item.price ?? 0),
+                changePercent: Number(
+                  item.change_percent ?? item.changePercent ?? 0,
+                ),
+                changeAbs: Number(item.change_abs ?? item.changeAbs ?? 0),
+                sparkline: Array.isArray(item.sparkline) ? item.sparkline : [],
+                volume: Number(item.volume ?? 0),
+              }))
+            : [];
+          setEquityCards(cards);
+          const sectors = Array.isArray(payload.sectors)
+            ? payload.sectors.map((item) => ({
+                symbol: String(item.symbol ?? ""),
+                name: String(item.name ?? ""),
+                changePercent: Number(
+                  item.change_percent ?? item.changePercent ?? 0,
+                ),
+              }))
+            : [];
+          setEquitySectors(sectors);
+          const indicators = Array.isArray(payload.indicators)
+            ? payload.indicators.map((item) => ({
+                id: String(item.id ?? ""),
+                label: String(item.label ?? ""),
+                value: Number(item.value ?? 0),
+                unit: String(item.unit ?? ""),
+                change: Number(item.change ?? 0),
+                signal: String(item.signal ?? ""),
+              }))
+            : [];
+          setEquityIndicators(indicators);
+          const strip = Array.isArray(payload.strip)
+            ? payload.strip.map((item) => ({
+                label: String(item.label ?? ""),
+                value: Number(item.value ?? 0),
+                change: Number(item.change ?? 0),
+                unit: String(item.unit ?? ""),
+              }))
+            : [];
+          setEquityStrip(strip);
+          const earnings = Array.isArray(payload.earnings)
+            ? payload.earnings.map((item) => ({
+                symbol: String(item.symbol ?? ""),
+                name: String(item.name ?? ""),
+                epsEst: Number(item.eps_est ?? item.epsEst ?? 0),
+                epsAct: Number(item.eps_act ?? item.epsAct ?? 0),
+                beat: Boolean(item.beat),
+                timing: String(item.timing ?? ""),
+              }))
+            : [];
+          setEquityEarnings(earnings);
+          setEquityNews(Array.isArray(payload.news) ? payload.news : []);
+          setAssetItems([]);
+          setCommodityItems([]);
+          setCommodityStrip([]);
+          setFixedIncomeCards([]);
+          setFixedIncomeCurve(null);
+          setFixedIncomeSpreads([]);
+          setFixedIncomeStrip([]);
+          setFixedIncomeNews([]);
+        } else if (activeAsset === "commodity") {
           const res = await fetch("/api/commodities");
           if (!res.ok) throw new Error(`${res.status}`);
           const payload = (await res.json()) as {
@@ -1753,6 +2106,17 @@ export default function CryptoDashboard() {
         setAssetItems([]);
         setCommodityItems([]);
         setCommodityStrip([]);
+        setFixedIncomeCards([]);
+        setFixedIncomeCurve(null);
+        setFixedIncomeSpreads([]);
+        setFixedIncomeStrip([]);
+        setFixedIncomeNews([]);
+        setEquityCards([]);
+        setEquitySectors([]);
+        setEquityIndicators([]);
+        setEquityStrip([]);
+        setEquityEarnings([]);
+        setEquityNews([]);
       } finally {
         setAssetLoading(false);
         setAssetRefreshing(false);
@@ -2161,16 +2525,30 @@ export default function CryptoDashboard() {
     image: undefined,
   }));
 
+  const equityOverviewItems = equityCards.map((item) => ({
+    id: item.id,
+    symbol: item.symbol,
+    name: item.name,
+    price: item.price,
+    changePercent: item.changePercent,
+    changeAbs: item.changeAbs,
+    sparkline: item.sparkline,
+  }));
+
   const activeItems = isCrypto
     ? yahooItems.length > 0
       ? yahooItems
       : cryptoItems
     : isCommodity
       ? commodityOverviewItems
-      : yahooItems;
+      : isFixedIncome || isEquity
+        ? []
+        : yahooItems;
   const marketOverviewItems = isCommodity
     ? commodityOverviewItems
-    : activeItems.slice(0, 10);
+    : isEquity
+      ? equityOverviewItems
+      : activeItems.slice(0, 10);
 
   const summaryMarketCap = yahooItems.reduce(
     (sum, item) => sum + item.marketCap,
@@ -2197,12 +2575,42 @@ export default function CryptoDashboard() {
     .slice(0, 6);
 
   const movers = activeTab === "gainers" ? gainers : losers;
+  const fixedIncomeRising = [...fixedIncomeCards]
+    .filter((item) => item.changeBps > 0)
+    .sort((a, b) => b.changeBps - a.changeBps)
+    .slice(0, 6);
+  const fixedIncomeFalling = [...fixedIncomeCards]
+    .filter((item) => item.changeBps < 0)
+    .sort((a, b) => a.changeBps - b.changeBps)
+    .slice(0, 6);
+  const fixedIncomeMovers =
+    fixedIncomeMoverTab === "rising" ? fixedIncomeRising : fixedIncomeFalling;
+  const equityGainers = [...equityCards]
+    .filter((item) => item.changePercent > 0)
+    .sort((a, b) => b.changePercent - a.changePercent)
+    .slice(0, 6);
+  const equityLosers = [...equityCards]
+    .filter((item) => item.changePercent < 0)
+    .sort((a, b) => a.changePercent - b.changePercent)
+    .slice(0, 6);
+  const equityVolume = [...equityCards]
+    .sort((a, b) => b.volume - a.volume)
+    .slice(0, 6);
+  const equityMovers =
+    equityMoverTab === "volume"
+      ? equityVolume
+      : equityMoverTab === "gainers"
+        ? equityGainers
+        : equityLosers;
+  const marketOverviewEmpty = isFixedIncome
+    ? fixedIncomeCards.length === 0
+    : isEquity
+      ? equityCards.length === 0
+      : marketOverviewItems.length === 0;
   const isPageLoading = isCrypto ? loading || assetLoading : assetLoading;
   const isRefreshing = isCrypto
     ? refreshing || assetRefreshing
     : assetRefreshing;
-
-  // ── Skeleton ──
   if (isPageLoading) {
     return (
       <div className="min-h-screen bg-[#000000] flex items-center justify-center">
@@ -2422,46 +2830,134 @@ export default function CryptoDashboard() {
                 )}
               </div>
             )}
-            {!isCrypto && !isCommodity && activeItems.length > 0 && (
-              <div className="flex flex-wrap items-center gap-x-5 gap-y-2 text-sm text-zinc-500 border-b border-white/[0.05] pb-4">
-                <div className="flex items-center gap-1.5">
-                  <Globe className="w-3 h-3" />
-                  <span>Market Cap</span>
-                  <span className="text-zinc-200 font-medium">
-                    {fmtBig(summaryMarketCap)}
-                  </span>
-                </div>
-                <div className="flex items-center gap-1.5">
-                  <BarChart2 className="w-3 h-3" />
-                  <span>24h Volume</span>
-                  <span className="text-zinc-200 font-medium">
-                    {fmtBig(summaryVolume)}
-                  </span>
-                </div>
-                {summaryGainer && (
-                  <div className="flex items-center gap-1.5">
-                    <span>Top Gainer</span>
-                    <span className="text-zinc-200 font-medium">
-                      {summaryGainer.symbol}
-                    </span>
-                    <span className="text-emerald-400">
-                      {pct(summaryGainer.changePercent)}
-                    </span>
+            {isFixedIncome && (
+              <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2.5 border-b border-white/[0.05] pb-4">
+                {fixedIncomeStrip.length === 0 ? (
+                  <div className="col-span-full bg-[#0a0a0a] border border-white/[0.07] rounded-xl p-4 text-center text-sm text-zinc-600">
+                    Market strip unavailable
                   </div>
-                )}
-                {summaryLoser && (
-                  <div className="flex items-center gap-1.5">
-                    <span>Top Loser</span>
-                    <span className="text-zinc-200 font-medium">
-                      {summaryLoser.symbol}
-                    </span>
-                    <span className="text-red-400">
-                      {pct(summaryLoser.changePercent)}
-                    </span>
-                  </div>
+                ) : (
+                  fixedIncomeStrip.map((item) => {
+                    const pos = item.changeBps >= 0;
+                    return (
+                      <div
+                        key={item.id}
+                        className="bg-[#0a0a0a] border border-white/[0.07] rounded-xl px-3.5 py-3"
+                      >
+                        <p className="text-xs uppercase tracking-wide text-zinc-500">
+                          {item.label}
+                        </p>
+                        <div className="mt-2 flex items-baseline justify-between">
+                          <span className="text-sm font-semibold text-zinc-200 tabular-nums">
+                            {item.unit === "%"
+                              ? fmtYield(item.value)
+                              : `${item.value.toFixed(0)} bps`}
+                          </span>
+                          <span
+                            className={`text-xs font-semibold tabular-nums ${
+                              pos ? "text-emerald-400" : "text-red-400"
+                            }`}
+                          >
+                            {fmtBps(item.changeBps)}
+                          </span>
+                        </div>
+                      </div>
+                    );
+                  })
                 )}
               </div>
             )}
+            {isEquity && (
+              <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-7 gap-2.5 border-b border-white/[0.05] pb-4">
+                {equityStrip.length === 0 ? (
+                  <div className="col-span-full bg-[#0a0a0a] border border-white/[0.07] rounded-xl p-4 text-center text-sm text-zinc-600">
+                    Market strip unavailable
+                  </div>
+                ) : (
+                  equityStrip.map((item) => {
+                    const pos = item.change >= 0;
+                    return (
+                      <div
+                        key={item.label}
+                        className="bg-[#0a0a0a] border border-white/[0.07] rounded-xl px-3.5 py-3"
+                      >
+                        <p className="text-xs uppercase tracking-wide text-zinc-500">
+                          {item.label}
+                        </p>
+                        <div className="mt-2 flex items-baseline justify-between">
+                          <span className="text-sm font-semibold text-zinc-200 tabular-nums">
+                            {item.unit === "%"
+                              ? fmtYield(item.value)
+                              : item.unit === "x"
+                                ? `${item.value.toFixed(1)}x`
+                                : item.unit === "ratio"
+                                  ? item.value.toFixed(2)
+                                  : item.value.toFixed(2)}
+                          </span>
+                          {item.unit === "%" ? (
+                            <span
+                              className="text-xs font-semibold tabular-nums"
+                              style={{ color: pos ? EQUITY_UP : EQUITY_DOWN }}
+                            >
+                              {pos ? "+" : "-"}
+                              {Math.abs(item.change).toFixed(2)}%
+                            </span>
+                          ) : (
+                            <span className="text-xs text-zinc-600">
+                              {item.unit}
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })
+                )}
+              </div>
+            )}
+            {!isCrypto &&
+              !isCommodity &&
+              !isFixedIncome &&
+              !isEquity &&
+              activeItems.length > 0 && (
+                <div className="flex flex-wrap items-center gap-x-5 gap-y-2 text-sm text-zinc-500 border-b border-white/[0.05] pb-4">
+                  <div className="flex items-center gap-1.5">
+                    <Globe className="w-3 h-3" />
+                    <span>Market Cap</span>
+                    <span className="text-zinc-200 font-medium">
+                      {fmtBig(summaryMarketCap)}
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-1.5">
+                    <BarChart2 className="w-3 h-3" />
+                    <span>24h Volume</span>
+                    <span className="text-zinc-200 font-medium">
+                      {fmtBig(summaryVolume)}
+                    </span>
+                  </div>
+                  {summaryGainer && (
+                    <div className="flex items-center gap-1.5">
+                      <span>Top Gainer</span>
+                      <span className="text-zinc-200 font-medium">
+                        {summaryGainer.symbol}
+                      </span>
+                      <span className="text-emerald-400">
+                        {pct(summaryGainer.changePercent)}
+                      </span>
+                    </div>
+                  )}
+                  {summaryLoser && (
+                    <div className="flex items-center gap-1.5">
+                      <span>Top Loser</span>
+                      <span className="text-zinc-200 font-medium">
+                        {summaryLoser.symbol}
+                      </span>
+                      <span className="text-red-400">
+                        {pct(summaryLoser.changePercent)}
+                      </span>
+                    </div>
+                  )}
+                </div>
+              )}
 
             {/* ── Market overview cards ── */}
             <section>
@@ -2469,10 +2965,109 @@ export default function CryptoDashboard() {
                 Market Overview
               </h2>
               <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-2.5">
-                {marketOverviewItems.length === 0 ? (
+                {marketOverviewEmpty ? (
                   <div className="col-span-full bg-[#0a0a0a] border border-white/[0.07] rounded-xl p-6 text-center text-sm text-zinc-600">
                     No market data available
                   </div>
+                ) : isFixedIncome ? (
+                  fixedIncomeCards.map((item) => {
+                    const pos = item.changeBps >= 0;
+                    return (
+                      <div
+                        key={item.id}
+                        className="group bg-[#0a0a0a] border border-white/[0.07] rounded-xl hover:border-white/[0.14] hover:bg-[#111] transition-all overflow-hidden"
+                      >
+                        <div className="px-3.5 pt-3.5 pb-2">
+                          <div className="flex items-start justify-between gap-2">
+                            <div className="min-w-0">
+                              <p className="text-xs uppercase tracking-wide text-zinc-500">
+                                {item.tenor}
+                              </p>
+                              <p className="text-sm font-semibold text-white mt-1 truncate">
+                                {item.name}
+                              </p>
+                              <p className="text-sm text-zinc-200 mt-1 tabular-nums">
+                                {fmtYield(item.yield)}
+                              </p>
+                            </div>
+                            <div className="text-right shrink-0">
+                              <span
+                                className={`text-sm font-semibold flex items-center justify-end gap-0.5 ${
+                                  pos ? "text-emerald-400" : "text-red-400"
+                                }`}
+                              >
+                                {pos ? (
+                                  <ArrowUpRight className="w-3 h-3" />
+                                ) : (
+                                  <ArrowDownRight className="w-3 h-3" />
+                                )}
+                                {fmtBps(item.changeBps)}
+                              </span>
+                            </div>
+                          </div>
+                        </div>
+                        {item.sparkline.length > 0 && (
+                          <CardSparkline
+                            data={item.sparkline}
+                            positive={pos}
+                            colorOverride={pos ? EQUITY_UP : EQUITY_DOWN}
+                            useGradient={false}
+                          />
+                        )}
+                      </div>
+                    );
+                  })
+                ) : isEquity ? (
+                  equityOverviewItems.map((item) => {
+                    const pos = item.changePercent >= 0;
+                    const changeAbs = Math.abs(item.changeAbs ?? 0);
+                    return (
+                      <div
+                        key={item.id}
+                        className="group bg-[#0a0a0a] border border-white/[0.07] rounded-xl hover:border-white/[0.14] hover:bg-[#111] transition-all overflow-hidden"
+                      >
+                        <div className="px-3.5 pt-3.5 pb-2">
+                          <div className="flex items-start justify-between gap-2">
+                            <div className="min-w-0">
+                              <p className="text-sm font-semibold text-white truncate leading-tight">
+                                {item.symbol}
+                                <span className="text-zinc-500 font-medium">
+                                  {" "}
+                                  {item.name}
+                                </span>
+                              </p>
+                              <p className="text-sm text-zinc-500 mt-1 tabular-nums">
+                                {fmt(item.price)}
+                              </p>
+                            </div>
+                            <div className="text-right shrink-0">
+                              <span
+                                className="text-sm font-semibold flex items-center justify-end gap-0.5"
+                                style={{ color: pos ? EQUITY_UP : EQUITY_DOWN }}
+                              >
+                                {pos ? (
+                                  <ArrowUpRight className="w-3 h-3" />
+                                ) : (
+                                  <ArrowDownRight className="w-3 h-3" />
+                                )}
+                                {Math.abs(item.changePercent).toFixed(2)}%
+                              </span>
+                              <p
+                                className="text-sm font-medium mt-0.5 tabular-nums"
+                                style={{ color: pos ? EQUITY_UP : EQUITY_DOWN }}
+                              >
+                                {pos ? "+" : "-"}
+                                {fmt(changeAbs)}
+                              </p>
+                            </div>
+                          </div>
+                        </div>
+                        {item.sparkline.length > 0 && (
+                          <CardSparkline data={item.sparkline} positive={pos} />
+                        )}
+                      </div>
+                    );
+                  })
                 ) : isCommodity ? (
                   marketOverviewItems.map((item) => {
                     const pos = item.changePercent >= 0;
@@ -2583,6 +3178,232 @@ export default function CryptoDashboard() {
               </div>
             </section>
 
+            {isFixedIncome && (
+              <section className="space-y-4">
+                <div>
+                  <h2 className="text-sm font-medium text-zinc-500 uppercase tracking-wider mb-3">
+                    Yield Curve
+                  </h2>
+                  <div className="bg-[#0a0a0a] border border-white/[0.07] rounded-xl p-4 h-64">
+                    {fixedIncomeCurve ? (
+                      <YieldCurveChart
+                        tenors={fixedIncomeCurve.tenors}
+                        today={fixedIncomeCurve.today}
+                        yesterday={fixedIncomeCurve.yesterday}
+                      />
+                    ) : (
+                      <div className="h-full flex items-center justify-center text-sm text-zinc-600">
+                        Curve unavailable
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                <div>
+                  <h2 className="text-sm font-medium text-zinc-500 uppercase tracking-wider mb-3">
+                    Key Spreads
+                  </h2>
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+                    {fixedIncomeSpreads.length === 0 ? (
+                      <div className="col-span-full bg-[#0a0a0a] border border-white/[0.07] rounded-xl p-6 text-center text-sm text-zinc-600">
+                        No spread data
+                      </div>
+                    ) : (
+                      fixedIncomeSpreads.map((item) => {
+                        const pos = item.changeBps >= 0;
+                        return (
+                          <div
+                            key={item.id}
+                            className="bg-[#0a0a0a] border border-white/[0.07] rounded-xl px-3.5 py-3"
+                          >
+                            <p className="text-xs uppercase tracking-wide text-zinc-500">
+                              {item.label}
+                            </p>
+                            <p className="text-sm font-semibold text-zinc-200 mt-2 tabular-nums">
+                              {item.unit === "%"
+                                ? fmtYield(item.value)
+                                : `${item.value.toFixed(0)} bps`}
+                            </p>
+                            <div className="flex items-center justify-between mt-1">
+                              <span
+                                className={`text-xs font-semibold tabular-nums ${
+                                  pos ? "text-emerald-400" : "text-red-400"
+                                }`}
+                              >
+                                {fmtBps(item.changeBps)}
+                              </span>
+                              <span className="text-xs text-zinc-600">
+                                {item.signal}
+                              </span>
+                            </div>
+                          </div>
+                        );
+                      })
+                    )}
+                  </div>
+                </div>
+              </section>
+            )}
+
+            {isEquity && (
+              <section className="space-y-4">
+                <div>
+                  <h2 className="text-sm font-medium text-zinc-500 uppercase tracking-wider mb-3">
+                    Sector Performance
+                  </h2>
+                  <div className="bg-[#0a0a0a] border border-white/[0.07] rounded-xl p-4 space-y-2">
+                    {equitySectors.length === 0 ? (
+                      <div className="text-center text-sm text-zinc-600">
+                        No sector data
+                      </div>
+                    ) : (
+                      equitySectors.map((sector) => {
+                        const pos = sector.changePercent >= 0;
+                        const width = Math.min(
+                          Math.abs(sector.changePercent) * 12,
+                          100,
+                        );
+                        return (
+                          <div key={sector.symbol} className="space-y-1">
+                            <div className="flex items-center justify-between text-xs text-zinc-500">
+                              <span className="uppercase tracking-wide">
+                                {sector.symbol}
+                              </span>
+                              <span
+                                className="tabular-nums"
+                                style={{ color: pos ? EQUITY_UP : EQUITY_DOWN }}
+                              >
+                                {pos ? "+" : "-"}
+                                {Math.abs(sector.changePercent).toFixed(2)}%
+                              </span>
+                            </div>
+                            <div className="h-2 bg-white/[0.06] rounded-full overflow-hidden">
+                              <div
+                                className="h-full rounded-full"
+                                style={{
+                                  width: `${width}%`,
+                                  background: pos ? EQUITY_UP : EQUITY_DOWN,
+                                }}
+                              />
+                            </div>
+                          </div>
+                        );
+                      })
+                    )}
+                  </div>
+                </div>
+
+                <div>
+                  <h2 className="text-sm font-medium text-zinc-500 uppercase tracking-wider mb-3">
+                    Market Indicators
+                  </h2>
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+                    {equityIndicators.length === 0 ? (
+                      <div className="col-span-full bg-[#0a0a0a] border border-white/[0.07] rounded-xl p-6 text-center text-sm text-zinc-600">
+                        No indicator data
+                      </div>
+                    ) : (
+                      equityIndicators.map((item) => (
+                        <div
+                          key={item.id}
+                          className="bg-[#0a0a0a] border border-white/[0.07] rounded-xl px-3.5 py-3"
+                        >
+                          <p className="text-xs uppercase tracking-wide text-zinc-500">
+                            {item.label}
+                          </p>
+                          <p className="text-sm font-semibold text-zinc-200 mt-2 tabular-nums">
+                            {item.unit === "%"
+                              ? fmtYield(item.value)
+                              : item.unit === "index"
+                                ? item.value.toFixed(0)
+                                : item.unit === "ratio"
+                                  ? item.value.toFixed(2)
+                                  : item.unit === "bn"
+                                    ? item.value.toFixed(0)
+                                    : item.value.toFixed(2)}
+                          </p>
+                          <div className="flex items-center justify-between mt-1">
+                            <span
+                              className="text-xs"
+                              style={{
+                                color:
+                                  item.id === "fear_greed"
+                                    ? "#fbbf24"
+                                    : "#52525b",
+                              }}
+                            >
+                              {item.signal}
+                            </span>
+                            {item.change !== 0 && (
+                              <span
+                                className="text-xs font-semibold tabular-nums"
+                                style={{
+                                  color:
+                                    item.change >= 0 ? EQUITY_UP : EQUITY_DOWN,
+                                }}
+                              >
+                                {item.change >= 0 ? "+" : "-"}
+                                {Math.abs(item.change).toFixed(2)}
+                              </span>
+                            )}
+                          </div>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                </div>
+
+                <div>
+                  <h2 className="text-sm font-medium text-zinc-500 uppercase tracking-wider mb-3">
+                    Earnings This Week
+                  </h2>
+                  <div className="bg-[#0a0a0a] border border-white/[0.07] rounded-xl overflow-hidden">
+                    {equityEarnings.length === 0 ? (
+                      <div className="p-6 text-center text-sm text-zinc-600">
+                        No earnings data
+                      </div>
+                    ) : (
+                      <div className="divide-y divide-white/[0.04]">
+                        <div className="grid grid-cols-5 px-4 py-2 text-xs uppercase tracking-wide text-zinc-500">
+                          <span>Symbol</span>
+                          <span>Company</span>
+                          <span className="text-right">Est</span>
+                          <span className="text-right">Actual</span>
+                          <span className="text-right">Timing</span>
+                        </div>
+                        {equityEarnings.map((row) => (
+                          <div
+                            key={row.symbol}
+                            className="grid grid-cols-5 px-4 py-2.5 text-sm text-zinc-200"
+                          >
+                            <span className="font-semibold">{row.symbol}</span>
+                            <span className="text-zinc-500 truncate">
+                              {row.name}
+                            </span>
+                            <span className="text-right tabular-nums">
+                              {row.epsEst.toFixed(2)}
+                            </span>
+                            <span
+                              className="text-right tabular-nums"
+                              style={{
+                                color: row.beat ? EQUITY_UP : EQUITY_DOWN,
+                              }}
+                            >
+                              {row.epsAct.toFixed(2)}
+                              {row.beat ? " ▲" : " ▼"}
+                            </span>
+                            <span className="text-right text-zinc-500">
+                              {row.timing}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </section>
+            )}
+
             {/* ── Top Movers ── */}
             <section>
               <div className="flex items-center justify-between mb-3">
@@ -2590,23 +3411,172 @@ export default function CryptoDashboard() {
                   Top Movers
                 </h2>
                 <div className="flex items-center gap-0.5 bg-white/[0.04] rounded-lg p-0.5">
-                  {(["gainers", "losers"] as const).map((tab) => (
-                    <button
-                      key={tab}
-                      onClick={() => setActiveTab(tab)}
-                      className={`px-2.5 py-1 rounded-md text-sm font-medium capitalize transition-colors ${
-                        activeTab === tab
-                          ? "bg-white/10 text-zinc-200"
-                          : "text-zinc-500 hover:text-zinc-300"
-                      }`}
-                    >
-                      {tab}
-                    </button>
-                  ))}
+                  {isFixedIncome
+                    ? (["rising", "falling"] as const).map((tab) => (
+                        <button
+                          key={tab}
+                          onClick={() => setFixedIncomeMoverTab(tab)}
+                          className={`px-2.5 py-1 rounded-md text-sm font-medium capitalize transition-colors ${
+                            fixedIncomeMoverTab === tab
+                              ? "bg-white/10 text-zinc-200"
+                              : "text-zinc-500 hover:text-zinc-300"
+                          }`}
+                        >
+                          {tab === "rising"
+                            ? "Rising Yields"
+                            : "Falling Yields"}
+                        </button>
+                      ))
+                    : isEquity
+                      ? (["gainers", "losers", "volume"] as const).map(
+                          (tab) => (
+                            <button
+                              key={tab}
+                              onClick={() => setEquityMoverTab(tab)}
+                              className={`px-2.5 py-1 rounded-md text-sm font-medium capitalize transition-colors ${
+                                equityMoverTab === tab
+                                  ? "bg-white/10 text-zinc-200"
+                                  : "text-zinc-500 hover:text-zinc-300"
+                              }`}
+                            >
+                              {tab === "volume" ? "High Volume" : tab}
+                            </button>
+                          ),
+                        )
+                      : (["gainers", "losers"] as const).map((tab) => (
+                          <button
+                            key={tab}
+                            onClick={() => setActiveTab(tab)}
+                            className={`px-2.5 py-1 rounded-md text-sm font-medium capitalize transition-colors ${
+                              activeTab === tab
+                                ? "bg-white/10 text-zinc-200"
+                                : "text-zinc-500 hover:text-zinc-300"
+                            }`}
+                          >
+                            {tab}
+                          </button>
+                        ))}
                 </div>
               </div>
               <div className="bg-[#0a0a0a] border border-white/[0.07] rounded-xl overflow-hidden">
-                {movers.length === 0 ? (
+                {isFixedIncome ? (
+                  fixedIncomeMovers.length === 0 ? (
+                    <div className="p-6 text-center text-sm text-zinc-600">
+                      No data
+                    </div>
+                  ) : (
+                    <div className="divide-y divide-white/[0.04]">
+                      {fixedIncomeMovers.map((item, i) => {
+                        const pos = item.changeBps >= 0;
+                        return (
+                          <div
+                            key={item.id}
+                            className="flex items-center gap-3 px-4 py-3 hover:bg-white/[0.02] transition-colors"
+                          >
+                            <span className="text-sm text-zinc-700 w-4 shrink-0 tabular-nums">
+                              {i + 1}
+                            </span>
+                            <div className="w-7 h-7 rounded-full shrink-0 bg-white/10 text-xs font-semibold text-zinc-200 flex items-center justify-center">
+                              {item.tenor}
+                            </div>
+                            <div className="min-w-0 flex-1">
+                              <p className="text-sm font-semibold text-zinc-200">
+                                {item.name}
+                              </p>
+                              <p className="text-xs text-zinc-600 mt-0.5">
+                                {fmtYield(item.yield)}
+                              </p>
+                            </div>
+                            <div className="shrink-0">
+                              <MiniSparkline
+                                data={item.sparkline}
+                                positive={pos}
+                                width={60}
+                                height={24}
+                              />
+                            </div>
+                            <div
+                              className={`text-sm font-semibold tabular-nums flex items-center gap-1 ${
+                                pos ? "text-emerald-400" : "text-red-400"
+                              }`}
+                            >
+                              {pos ? (
+                                <ChevronUp className="w-3 h-3" />
+                              ) : (
+                                <ChevronDown className="w-3 h-3" />
+                              )}
+                              {fmtBps(item.changeBps)}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )
+                ) : isEquity ? (
+                  equityMovers.length === 0 ? (
+                    <div className="p-6 text-center text-sm text-zinc-600">
+                      No data
+                    </div>
+                  ) : (
+                    <div className="divide-y divide-white/[0.04]">
+                      {equityMovers.map((item, i) => {
+                        const pos = item.changePercent >= 0;
+                        return (
+                          <div
+                            key={item.id}
+                            className="flex items-center gap-2.5 px-4 py-2.5 hover:bg-white/[0.02] transition-colors"
+                          >
+                            <span className="text-sm text-zinc-700 w-3 shrink-0 tabular-nums">
+                              {i + 1}
+                            </span>
+                            <div className="w-6 h-6 rounded-full shrink-0 bg-white/10 text-xs font-semibold text-zinc-200 flex items-center justify-center">
+                              {item.symbol}
+                            </div>
+                            <div className="flex-1 min-w-0">
+                              <div className="flex items-center justify-between">
+                                <span className="text-sm font-semibold text-zinc-200 uppercase">
+                                  {item.symbol}
+                                </span>
+                                <span className="text-sm font-semibold tabular-nums">
+                                  {fmt(item.price)}
+                                </span>
+                              </div>
+                              <div className="flex items-center justify-between mt-0.5">
+                                <span className="text-sm text-zinc-600 truncate">
+                                  {item.name}
+                                </span>
+                                <span
+                                  className="text-sm font-medium tabular-nums flex items-center gap-0.5"
+                                  style={{
+                                    color: pos ? EQUITY_UP : EQUITY_DOWN,
+                                  }}
+                                >
+                                  {pos ? (
+                                    <ArrowUpRight className="w-2.5 h-2.5" />
+                                  ) : (
+                                    <ArrowDownRight className="w-2.5 h-2.5" />
+                                  )}
+                                  {Math.abs(item.changePercent).toFixed(2)}%
+                                </span>
+                              </div>
+                            </div>
+                            {item.sparkline.length > 0 && (
+                              <div className="shrink-0">
+                                <Sparkline
+                                  data={item.sparkline}
+                                  positive={pos}
+                                  colorOverride={pos ? EQUITY_UP : EQUITY_DOWN}
+                                  width={56}
+                                  height={28}
+                                />
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )
+                ) : movers.length === 0 ? (
                   <div className="p-6 text-center text-sm text-zinc-600">
                     No data
                   </div>
@@ -2977,6 +3947,94 @@ export default function CryptoDashboard() {
                   ) : (
                     <div className="divide-y divide-white/[0.04]">
                       {commodityNews.map((item, idx) => (
+                        <a
+                          key={`${item.link}-${idx}`}
+                          href={item.link}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="block px-4 py-3 hover:bg-white/[0.02] transition-colors"
+                        >
+                          <p className="text-sm text-zinc-200 leading-snug mb-2">
+                            {item.title}
+                          </p>
+                          <div className="flex items-center gap-2 text-xs text-zinc-600">
+                            <span className="uppercase tracking-wide text-[10px] px-2 py-0.5 rounded-full bg-white/10 text-zinc-300">
+                              {item.tag}
+                            </span>
+                            <span>{item.publisher}</span>
+                            <span className="text-zinc-700">
+                              {item.timeAgo}
+                            </span>
+                          </div>
+                        </a>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </section>
+            </aside>
+          )}
+          {isEquity && (
+            <aside className="w-full lg:w-[300px] lg:shrink-0 lg:sticky lg:top-[57px] lg:self-start">
+              <section>
+                <div className="flex items-center justify-between mb-3">
+                  <h2 className="text-sm font-medium text-zinc-500 uppercase tracking-wider">
+                    Equity News
+                  </h2>
+                  <span className="text-sm text-zinc-600">Google News</span>
+                </div>
+                <div className="bg-[#0a0a0a] border border-white/[0.07] rounded-xl overflow-hidden">
+                  {equityNews.length === 0 ? (
+                    <div className="p-6 text-center text-sm text-zinc-600">
+                      No news available
+                    </div>
+                  ) : (
+                    <div className="divide-y divide-white/[0.04]">
+                      {equityNews.map((item, idx) => (
+                        <a
+                          key={`${item.link}-${idx}`}
+                          href={item.link}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="block px-4 py-3 hover:bg-white/[0.02] transition-colors"
+                        >
+                          <p className="text-sm text-zinc-200 leading-snug mb-2">
+                            {item.title}
+                          </p>
+                          <div className="flex items-center gap-2 text-xs text-zinc-600">
+                            <span className="uppercase tracking-wide text-[10px] px-2 py-0.5 rounded-full bg-white/10 text-zinc-300">
+                              {item.tag}
+                            </span>
+                            <span>{item.publisher}</span>
+                            <span className="text-zinc-700">
+                              {item.timeAgo}
+                            </span>
+                          </div>
+                        </a>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </section>
+            </aside>
+          )}
+          {isFixedIncome && (
+            <aside className="w-full lg:w-[300px] lg:shrink-0 lg:sticky lg:top-[57px] lg:self-start">
+              <section>
+                <div className="flex items-center justify-between mb-3">
+                  <h2 className="text-sm font-medium text-zinc-500 uppercase tracking-wider">
+                    Fixed Income News
+                  </h2>
+                  <span className="text-sm text-zinc-600">Google News</span>
+                </div>
+                <div className="bg-[#0a0a0a] border border-white/[0.07] rounded-xl overflow-hidden">
+                  {fixedIncomeNews.length === 0 ? (
+                    <div className="p-6 text-center text-sm text-zinc-600">
+                      No news available
+                    </div>
+                  ) : (
+                    <div className="divide-y divide-white/[0.04]">
+                      {fixedIncomeNews.map((item, idx) => (
                         <a
                           key={`${item.link}-${idx}`}
                           href={item.link}

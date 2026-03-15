@@ -35,6 +35,8 @@ import os
 load_dotenv()
 
 from routers.agent_orchestration import router as orchestration_router
+from routers.fixed_income import router as fixed_income_router
+from routers.equity import router as equity_router
 
 SUPABASE_URL    = os.getenv("SUPABASE_URL")
 SUPABASE_KEY    = os.getenv("SUPABASE_KEY")
@@ -242,6 +244,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.include_router(orchestration_router)
+app.include_router(fixed_income_router)
+app.include_router(equity_router)
 
 
 # ─────────────────────────────────────────────────────────────
