@@ -117,6 +117,31 @@ interface NewsItem {
   publishedAt?: string;
 }
 
+interface CommodityItem {
+  ticker: string;
+  symbol: string;
+  name: string;
+  price: number;
+  changePercent: number;
+  changeAbs: number;
+  sparkline: number[];
+}
+
+interface CommodityStripItem {
+  id: string;
+  label: string;
+  price: number;
+  changePercent: number;
+}
+
+interface CommodityNewsItem {
+  title: string;
+  link: string;
+  tag: string;
+  publisher: string;
+  timeAgo: string;
+}
+
 interface PortfolioPosition {
   symbol: string;
   side: string;
@@ -287,6 +312,72 @@ const ASSET_TABS = [
   { label: "Commodity", value: "commodity" },
 ] as const;
 
+const COMMODITY_META: Record<
+  string,
+  { label: string; abbr: string; color: string; tint: string }
+> = {
+  XAU: {
+    label: "Gold",
+    abbr: "AU",
+    color: "#f5c14b",
+    tint: "rgba(245, 193, 75, 0.12)",
+  },
+  XAG: {
+    label: "Silver",
+    abbr: "AG",
+    color: "#9ca3af",
+    tint: "rgba(156, 163, 175, 0.12)",
+  },
+  WTI: {
+    label: "Crude Oil",
+    abbr: "WT",
+    color: "#f97316",
+    tint: "rgba(249, 115, 22, 0.12)",
+  },
+  NG: {
+    label: "Nat Gas",
+    abbr: "NG",
+    color: "#22d3ee",
+    tint: "rgba(34, 211, 238, 0.12)",
+  },
+  HG: {
+    label: "Copper",
+    abbr: "CU",
+    color: "#fb923c",
+    tint: "rgba(251, 146, 60, 0.12)",
+  },
+  XPT: {
+    label: "Platinum",
+    abbr: "PT",
+    color: "#cbd5e1",
+    tint: "rgba(203, 213, 225, 0.12)",
+  },
+  ZW: {
+    label: "Wheat",
+    abbr: "WH",
+    color: "#fbbf24",
+    tint: "rgba(251, 191, 36, 0.12)",
+  },
+  ZC: {
+    label: "Corn",
+    abbr: "CN",
+    color: "#f59e0b",
+    tint: "rgba(245, 158, 11, 0.12)",
+  },
+  ZS: {
+    label: "Soybeans",
+    abbr: "SB",
+    color: "#84cc16",
+    tint: "rgba(132, 204, 22, 0.12)",
+  },
+  KC: {
+    label: "Coffee",
+    abbr: "CF",
+    color: "#a16207",
+    tint: "rgba(161, 98, 7, 0.12)",
+  },
+};
+
 type AssetTab = (typeof ASSET_TABS)[number]["value"];
 
 function normalizeAssetTab(value: string | null): AssetTab {
@@ -305,6 +396,17 @@ function formatQtyFromNotional(
   if (!Number.isFinite(qty) || qty <= 0) return "1";
   if (qty >= 1) return qty.toFixed(4).replace(/\.?0+$/, "");
   return qty.toFixed(6).replace(/\.?0+$/, "");
+}
+
+function getCommodityMeta(symbol: string) {
+  return (
+    COMMODITY_META[symbol.toUpperCase()] ?? {
+      label: symbol.toUpperCase(),
+      abbr: symbol.slice(0, 2).toUpperCase(),
+      color: "#94a3b8",
+      tint: "rgba(148, 163, 184, 0.12)",
+    }
+  );
 }
 
 // ─── Sparkline ────────────────────────────────────────────────────────────────
@@ -345,6 +447,54 @@ function Sparkline({
       width={width}
       height={height}
     />
+  );
+}
+
+function buildSparklinePath(values: number[], width: number, height: number) {
+  const points = values.filter((v) => Number.isFinite(v));
+  if (points.length < 2) return "";
+  const min = Math.min(...points);
+  const max = Math.max(...points);
+  const range = max - min || 1;
+  return points
+    .map((value, index) => {
+      const x = (index / (points.length - 1)) * width;
+      const y = height - ((value - min) / range) * height;
+      return `${index === 0 ? "M" : "L"} ${x.toFixed(2)} ${y.toFixed(2)}`;
+    })
+    .join(" ");
+}
+
+function MiniSparkline({
+  data,
+  positive,
+  width = 96,
+  height = 40,
+}: {
+  data: number[];
+  positive: boolean;
+  width?: number;
+  height?: number;
+}) {
+  const color = positive ? "#22c55e" : "#ef4444";
+  const path = buildSparklinePath(data, width, height);
+
+  if (!path) return <div style={{ width, height }} />;
+
+  return (
+    <svg
+      width={width}
+      height={height}
+      viewBox={`0 0 ${width} ${height}`}
+      aria-hidden="true"
+    >
+      <path
+        d={`${path} L ${width} ${height} L 0 ${height} Z`}
+        fill={color}
+        opacity={0.12}
+      />
+      <path d={path} fill="none" stroke={color} strokeWidth={1.6} />
+    </svg>
   );
 }
 
@@ -1498,11 +1648,18 @@ export default function CryptoDashboard() {
   const searchParams = useSearchParams();
   const activeAsset = normalizeAssetTab(searchParams.get("asset"));
   const isCrypto = activeAsset === "crypto";
+  const isCommodity = activeAsset === "commodity";
   const [coins, setCoins] = useState<CoinData[]>([]);
   const [globalData, setGlobalData] = useState<GlobalData | null>(null);
   const [assetItems, setAssetItems] = useState<MarketItem[]>([]);
   const [assetLoading, setAssetLoading] = useState(false);
   const [assetRefreshing, setAssetRefreshing] = useState(false);
+  const [commodityItems, setCommodityItems] = useState<CommodityItem[]>([]);
+  const [commodityStrip, setCommodityStrip] = useState<CommodityStripItem[]>(
+    [],
+  );
+  const [commodityNews, setCommodityNews] = useState<CommodityNewsItem[]>([]);
+  const [commodityNewsLoading, setCommodityNewsLoading] = useState(false);
   const [predictions, setPredictions] = useState<PredictionMarket[]>([]);
   const [sentiment, setSentiment] = useState<SentimentData | null>(null);
   const [loading, setLoading] = useState(true);
@@ -1571,14 +1728,30 @@ export default function CryptoDashboard() {
       else setAssetRefreshing(true);
 
       try {
-        const res = await fetch(`/api/market-overview?asset=${activeAsset}`);
-        if (!res.ok) throw new Error(`${res.status}`);
-        const payload = (await res.json()) as { items?: MarketItem[] };
-        if (Array.isArray(payload.items)) setAssetItems(payload.items);
-        else setAssetItems([]);
+        if (activeAsset === "commodity") {
+          const res = await fetch("/api/commodities");
+          if (!res.ok) throw new Error(`${res.status}`);
+          const payload = (await res.json()) as {
+            items?: CommodityItem[];
+            strip?: CommodityStripItem[];
+          };
+          if (Array.isArray(payload.items)) setCommodityItems(payload.items);
+          else setCommodityItems([]);
+          if (Array.isArray(payload.strip)) setCommodityStrip(payload.strip);
+          else setCommodityStrip([]);
+          setAssetItems([]);
+        } else {
+          const res = await fetch(`/api/market-overview?asset=${activeAsset}`);
+          if (!res.ok) throw new Error(`${res.status}`);
+          const payload = (await res.json()) as { items?: MarketItem[] };
+          if (Array.isArray(payload.items)) setAssetItems(payload.items);
+          else setAssetItems([]);
+        }
       } catch (e) {
         console.error("Market overview error:", e);
         setAssetItems([]);
+        setCommodityItems([]);
+        setCommodityStrip([]);
       } finally {
         setAssetLoading(false);
         setAssetRefreshing(false);
@@ -1587,12 +1760,32 @@ export default function CryptoDashboard() {
     [activeAsset],
   );
 
+  const fetchCommodityNews = useCallback(async () => {
+    if (!isCommodity) return;
+    setCommodityNewsLoading(true);
+    try {
+      const res = await fetch("/api/commodity-news");
+      if (!res.ok) throw new Error(`${res.status}`);
+      const payload = (await res.json()) as { items?: CommodityNewsItem[] };
+      if (Array.isArray(payload.items)) setCommodityNews(payload.items);
+      else setCommodityNews([]);
+    } catch (e) {
+      console.error("Commodity news error:", e);
+      setCommodityNews([]);
+    } finally {
+      setCommodityNewsLoading(false);
+    }
+  }, [isCommodity]);
+
   const refreshMarketData = useCallback(() => {
     void fetchAssetData(true);
     if (isCrypto) {
       void fetchData(true);
     }
-  }, [fetchAssetData, fetchData, isCrypto]);
+    if (isCommodity) {
+      void fetchCommodityNews();
+    }
+  }, [fetchAssetData, fetchData, fetchCommodityNews, isCommodity, isCrypto]);
 
   useEffect(() => {
     if (!isCrypto) {
@@ -1609,6 +1802,13 @@ export default function CryptoDashboard() {
     const timer = setInterval(() => fetchAssetData(true), 60_000);
     return () => clearInterval(timer);
   }, [fetchAssetData]);
+
+  useEffect(() => {
+    if (!isCommodity) return;
+    fetchCommodityNews();
+    const timer = setInterval(() => fetchCommodityNews(), 300_000);
+    return () => clearInterval(timer);
+  }, [fetchCommodityNews, isCommodity]);
 
   useEffect(() => {
     if (showChat) chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -1947,31 +2147,50 @@ export default function CryptoDashboard() {
     image: undefined,
   }));
 
+  const commodityOverviewItems = commodityItems.map((item) => ({
+    id: item.symbol,
+    symbol: item.symbol.toUpperCase(),
+    name: item.name,
+    price: item.price,
+    changePercent: item.changePercent,
+    changeAbs: item.changeAbs,
+    marketCap: 0,
+    volume: 0,
+    sparkline: item.sparkline,
+    image: undefined,
+  }));
+
   const activeItems = isCrypto
     ? yahooItems.length > 0
       ? yahooItems
       : cryptoItems
-    : yahooItems;
-  const marketOverviewItems = activeItems.slice(0, 10);
+    : isCommodity
+      ? commodityOverviewItems
+      : yahooItems;
+  const marketOverviewItems = isCommodity
+    ? commodityOverviewItems
+    : activeItems.slice(0, 10);
 
-  const summaryMarketCap = activeItems.reduce(
+  const summaryMarketCap = yahooItems.reduce(
     (sum, item) => sum + item.marketCap,
     0,
   );
-  const summaryVolume = activeItems.reduce((sum, item) => sum + item.volume, 0);
-  const summaryGainer = [...activeItems].sort(
+  const summaryVolume = yahooItems.reduce((sum, item) => sum + item.volume, 0);
+  const summaryGainer = [...yahooItems].sort(
     (a, b) => b.changePercent - a.changePercent,
   )[0];
-  const summaryLoser = [...activeItems].sort(
+  const summaryLoser = [...yahooItems].sort(
     (a, b) => a.changePercent - b.changePercent,
   )[0];
 
-  const gainers = activeItems
+  const moversBase = isCommodity ? commodityOverviewItems : activeItems;
+
+  const gainers = moversBase
     .filter((item) => item.changePercent > 0)
     .sort((a, b) => b.changePercent - a.changePercent)
     .slice(0, 6);
 
-  const losers = activeItems
+  const losers = moversBase
     .filter((item) => item.changePercent < 0)
     .sort((a, b) => a.changePercent - b.changePercent)
     .slice(0, 6);
@@ -2157,7 +2376,43 @@ export default function CryptoDashboard() {
                 </div>
               </div>
             )}
-            {!isCrypto && activeItems.length > 0 && (
+            {isCommodity && (
+              <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-2.5 border-b border-white/[0.05] pb-4">
+                {commodityStrip.length === 0 ? (
+                  <div className="col-span-full bg-[#0a0a0a] border border-white/[0.07] rounded-xl p-4 text-center text-sm text-zinc-600">
+                    Market strip unavailable
+                  </div>
+                ) : (
+                  commodityStrip.map((item) => {
+                    const pos = item.changePercent >= 0;
+                    return (
+                      <div
+                        key={item.id}
+                        className="bg-[#0a0a0a] border border-white/[0.07] rounded-xl px-3.5 py-3"
+                      >
+                        <p className="text-xs uppercase tracking-wide text-zinc-500">
+                          {item.label}
+                        </p>
+                        <div className="mt-2 flex items-baseline justify-between">
+                          <span className="text-sm font-semibold text-zinc-200 tabular-nums">
+                            {fmt(item.price)}
+                          </span>
+                          <span
+                            className={`text-xs font-semibold tabular-nums ${
+                              pos ? "text-emerald-400" : "text-red-400"
+                            }`}
+                          >
+                            {pos ? "+" : "-"}
+                            {Math.abs(item.changePercent).toFixed(2)}%
+                          </span>
+                        </div>
+                      </div>
+                    );
+                  })
+                )}
+              </div>
+            )}
+            {!isCrypto && !isCommodity && activeItems.length > 0 && (
               <div className="flex flex-wrap items-center gap-x-5 gap-y-2 text-sm text-zinc-500 border-b border-white/[0.05] pb-4">
                 <div className="flex items-center gap-1.5">
                   <Globe className="w-3 h-3" />
@@ -2208,6 +2463,55 @@ export default function CryptoDashboard() {
                   <div className="col-span-full bg-[#0a0a0a] border border-white/[0.07] rounded-xl p-6 text-center text-sm text-zinc-600">
                     No market data available
                   </div>
+                ) : isCommodity ? (
+                  marketOverviewItems.map((item) => {
+                    const pos = item.changePercent >= 0;
+                    const changeAbs = Math.abs(item.changeAbs ?? 0);
+                    return (
+                      <div
+                        key={item.id}
+                        className="group bg-[#0a0a0a] border border-white/[0.07] rounded-xl hover:border-white/[0.14] hover:bg-[#111] transition-all cursor-pointer overflow-hidden"
+                      >
+                        <div className="px-3.5 pt-3.5 pb-2">
+                          <div className="flex items-start justify-between gap-2">
+                            <div className="min-w-0">
+                              <p className="text-sm font-semibold text-white truncate leading-tight">
+                                {item.name}
+                              </p>
+                              <p className="text-sm text-zinc-500 mt-1 tabular-nums">
+                                {fmt(item.price)}
+                              </p>
+                            </div>
+                            <div className="text-right shrink-0">
+                              <span
+                                className={`text-sm font-semibold flex items-center justify-end gap-0.5 ${
+                                  pos ? "text-emerald-400" : "text-red-400"
+                                }`}
+                              >
+                                {pos ? (
+                                  <ArrowUpRight className="w-3 h-3" />
+                                ) : (
+                                  <ArrowDownRight className="w-3 h-3" />
+                                )}
+                                {Math.abs(item.changePercent).toFixed(2)}%
+                              </span>
+                              <p
+                                className={`text-sm font-medium mt-0.5 tabular-nums ${
+                                  pos ? "text-emerald-600" : "text-red-600"
+                                }`}
+                              >
+                                {pos ? "+" : "-"}
+                                {fmt(changeAbs)}
+                              </p>
+                            </div>
+                          </div>
+                        </div>
+                        {item.sparkline.length > 0 && (
+                          <CardSparkline data={item.sparkline} positive={pos} />
+                        )}
+                      </div>
+                    );
+                  })
                 ) : (
                   marketOverviewItems.map((item) => {
                     const pos = item.changePercent >= 0;
@@ -2295,6 +2599,61 @@ export default function CryptoDashboard() {
                 {movers.length === 0 ? (
                   <div className="p-6 text-center text-sm text-zinc-600">
                     No data
+                  </div>
+                ) : isCommodity ? (
+                  <div className="divide-y divide-white/[0.04]">
+                    {movers.map((item, i) => {
+                      const pos = item.changePercent >= 0;
+                      const meta = getCommodityMeta(item.symbol);
+                      return (
+                        <div
+                          key={item.id}
+                          className="flex items-center gap-3 px-4 py-3 hover:bg-white/[0.02] transition-colors"
+                        >
+                          <span className="text-sm text-zinc-700 w-4 shrink-0 tabular-nums">
+                            {i + 1}
+                          </span>
+                          <div
+                            className="w-7 h-7 rounded-full shrink-0 text-xs font-semibold text-zinc-100 flex items-center justify-center"
+                            style={{ background: meta.tint, color: meta.color }}
+                          >
+                            {meta.abbr}
+                          </div>
+                          <div className="min-w-0 flex-1">
+                            <p className="text-sm font-semibold text-zinc-200">
+                              {item.symbol}
+                              <span className="text-zinc-500 font-medium">
+                                {" "}
+                                {item.name}
+                              </span>
+                            </p>
+                            <p className="text-xs text-zinc-600 mt-0.5">
+                              {fmt(item.price)}
+                            </p>
+                          </div>
+                          <div className="shrink-0">
+                            <MiniSparkline
+                              data={item.sparkline}
+                              positive={pos}
+                              width={60}
+                              height={24}
+                            />
+                          </div>
+                          <div
+                            className={`text-sm font-semibold tabular-nums flex items-center gap-1 ${
+                              pos ? "text-emerald-400" : "text-red-400"
+                            }`}
+                          >
+                            {pos ? (
+                              <ChevronUp className="w-3 h-3" />
+                            ) : (
+                              <ChevronDown className="w-3 h-3" />
+                            )}
+                            {Math.abs(item.changePercent).toFixed(2)}%
+                          </div>
+                        </div>
+                      );
+                    })}
                   </div>
                 ) : (
                   <div className="divide-y divide-white/[0.04]">
@@ -2587,6 +2946,54 @@ export default function CryptoDashboard() {
               </section>
             </aside>
           )}
+          {isCommodity && (
+            <aside className="w-full lg:w-[300px] lg:shrink-0 lg:sticky lg:top-[57px] lg:self-start">
+              <section>
+                <div className="flex items-center justify-between mb-3">
+                  <h2 className="text-sm font-medium text-zinc-500 uppercase tracking-wider">
+                    Commodity News
+                  </h2>
+                  <span className="text-sm text-zinc-600">Google News</span>
+                </div>
+                <div className="bg-[#0a0a0a] border border-white/[0.07] rounded-xl overflow-hidden">
+                  {commodityNewsLoading ? (
+                    <div className="p-6 text-center text-sm text-zinc-600">
+                      Loading news...
+                    </div>
+                  ) : commodityNews.length === 0 ? (
+                    <div className="p-6 text-center text-sm text-zinc-600">
+                      No news available
+                    </div>
+                  ) : (
+                    <div className="divide-y divide-white/[0.04]">
+                      {commodityNews.map((item, idx) => (
+                        <a
+                          key={`${item.link}-${idx}`}
+                          href={item.link}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="block px-4 py-3 hover:bg-white/[0.02] transition-colors"
+                        >
+                          <p className="text-sm text-zinc-200 leading-snug mb-2">
+                            {item.title}
+                          </p>
+                          <div className="flex items-center gap-2 text-xs text-zinc-600">
+                            <span className="uppercase tracking-wide text-[10px] px-2 py-0.5 rounded-full bg-white/10 text-zinc-300">
+                              {item.tag}
+                            </span>
+                            <span>{item.publisher}</span>
+                            <span className="text-zinc-700">
+                              {item.timeAgo}
+                            </span>
+                          </div>
+                        </a>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </section>
+            </aside>
+          )}
         </div>
         {/* end outer flex */}
       </main>
@@ -2641,8 +3048,8 @@ export default function CryptoDashboard() {
             </div>
             <p className="text-center text-sm text-zinc-700 mt-2">
               <TrendingUp className="w-3 h-3 inline -mt-0.5 mr-1" />
-              Powered by OpenRouter · Market data from CoinGecko, Yahoo Finance &
-              Polymarket
+              Powered by OpenRouter · Market data from CoinGecko, Yahoo Finance
+              & Polymarket
             </p>
           </form>
         </div>
