@@ -208,12 +208,13 @@ async def preload_macro():
     global _cached_macro_all
     if _cached_macro_all is not None:
         return
-    print("Preloading macro data from Supabase...")
+    logger.info("Preloading macro data from Supabase.")
     loop = asyncio.get_event_loop()
     _cached_macro_all = await loop.run_in_executor(None, _get_macro_sync)
-    print(
-        f"Macro data ready: {len(_cached_macro_all):,} rows × "
-        f"{len(_cached_macro_all.columns)} cols"
+    logger.info(
+        "Macro data ready: %s rows x %s cols",
+        f"{len(_cached_macro_all):,}",
+        len(_cached_macro_all.columns),
     )
 
 
@@ -1003,6 +1004,7 @@ def _build_backtest_stream_response(
             push_event("result", result)
             push_event("done", {"status": "completed"})
         except Exception as exc:
+            logger.exception("Streaming backtest worker failed: %s", exc)
             push_event(
                 "error",
                 {
@@ -1058,6 +1060,7 @@ def _run_batch_job(job_id: str, request: BatchBacktestRequest):
             )
             results.append(metrics)
         except Exception as e:
+            logger.exception("Batch backtest failed for job_id=%s prompt=%r", job_id, prompt)
             errors.append({"prompt": prompt, "error": str(e)})
 
     jobs[job_id]["status"]  = "done"
@@ -1081,6 +1084,7 @@ def _run_batch_job_sphinx(job_id: str, request: BatchBacktestRequest):
             )
             results.append(metrics)
         except Exception as e:
+            logger.exception("Sphinx batch backtest failed for job_id=%s prompt=%r", job_id, prompt)
             errors.append({"prompt": prompt, "error": str(e)})
 
     jobs[job_id]["status"] = "done"
@@ -1104,6 +1108,7 @@ def _fetch_commodity_quote(ticker: str) -> dict[str, Any]:
         hist = yf_ticker.history(period="1d", interval="30m")
         fast_info = yf_ticker.fast_info
     except Exception as exc:
+        logger.warning("Commodity quote fetch failed for ticker=%s: %s", ticker, exc)
         return {
             "price": 0.0,
             "change_abs": 0.0,
@@ -1179,6 +1184,7 @@ async def yfinance_detail(symbol: str = Query(...), range: str = Query("1D")):
     try:
         import yfinance as yf
     except Exception:
+        logger.exception("yfinance import failed for /yfinance/detail")
         return {"error": "yfinance not installed"}
 
     symbol = symbol.strip().upper()
@@ -1193,6 +1199,7 @@ async def yfinance_detail(symbol: str = Query(...), range: str = Query("1D")):
         fast_info = ticker.fast_info
         full_info = ticker.info if hasattr(ticker, "info") else {}
     except Exception as e:
+        logger.warning("yfinance detail fetch failed for symbol=%s range=%s: %s", symbol, range, e)
         return {"error": f"yfinance fetch failed: {e}"}
 
     def fast_get(key, default=0):
@@ -1351,6 +1358,7 @@ def list_macro_columns():
     try:
         macro = _get_macro_sync()
     except Exception as e:
+        logger.exception("Macro columns request failed.")
         raise HTTPException(503, str(e))
     return {"columns": sorted(macro.columns.tolist())}
 
@@ -1361,6 +1369,7 @@ def macro_snapshot():
     try:
         macro = _get_macro_sync()
     except Exception as e:
+        logger.exception("Macro snapshot request failed.")
         raise HTTPException(503, str(e))
     latest = macro.iloc[-1].dropna()
     return {
@@ -1389,6 +1398,13 @@ async def run_backtest(request: BacktestRequest):
         )
         return result
     except Exception as e:
+        logger.exception(
+            "Backtest request failed. model=%s start=%s end=%s initial_cash=%s",
+            request.model,
+            request.start,
+            request.end,
+            request.initial_cash,
+        )
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1437,6 +1453,12 @@ async def run_backtest_sphinx(request: BacktestRequest):
         )
         return result
     except Exception as e:
+        logger.exception(
+            "Sphinx backtest request failed. start=%s end=%s initial_cash=%s",
+            request.start,
+            request.end,
+            request.initial_cash,
+        )
         raise HTTPException(status_code=500, detail=str(e))
 
 

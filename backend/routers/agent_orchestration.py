@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import re
 import shutil
@@ -26,6 +27,7 @@ from pydantic import BaseModel, Field
 
 
 router = APIRouter(prefix="/orchestration", tags=["Orchestration"])
+logger = logging.getLogger("uvicorn.error")
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
@@ -40,6 +42,14 @@ def _openrouter_base() -> str:
 
 def _openrouter_model() -> str:
     return os.getenv("MODEL", "openai/gpt-4o-mini")
+
+
+def _openrouter_timeout_seconds() -> float:
+    raw = os.getenv("OPENROUTER_TIMEOUT_SECONDS", "45")
+    try:
+        return max(5.0, float(raw))
+    except ValueError:
+        return 45.0
 
 
 def _sphinx_api_key() -> str | None:
@@ -231,6 +241,12 @@ Output format:
         if return_code == 0 and stdout:
             return {"memo_markdown": stdout, "sphinx_stdout": stdout, "fallback": False}
     except Exception as err:
+        logger.exception(
+            "Sphinx ideation failed for run_id=%s analyst_id=%s analyst_name=%s",
+            run_id,
+            analyst.id,
+            analyst.name,
+        )
         _append_event(
             run_id,
             agent_id=analyst.id,
@@ -262,7 +278,7 @@ Create a monthly-rebalanced strategy that rotates across {", ".join(analyst.asse
     return {"memo_markdown": fallback, "sphinx_stdout": "".join(output_lines), "fallback": True}
 
 
-def _analyst_self_critique(analyst: AgentConfig, memo_markdown: str) -> str:
+def _analyst_self_critique(run_id: str, analyst: AgentConfig, memo_markdown: str) -> str:
     system_prompt = f"""
 You are {analyst.name}, critiquing your own strategy before manager review.
 Return 3 concise bullets:
@@ -270,7 +286,15 @@ Return 3 concise bullets:
 2) main fragility
 3) one concrete revision
 """.strip()
-    output = _run_openrouter_chat(system_prompt, memo_markdown)
+    output = _run_openrouter_chat(
+        system_prompt,
+        memo_markdown,
+        run_id=run_id,
+        agent_id=analyst.id,
+        agent_name=analyst.name,
+        stage="critique",
+        task_label="self-critique",
+    )
     if output:
         return output
     return (
@@ -280,7 +304,12 @@ Return 3 concise bullets:
     )
 
 
-def _manager_critique_round(manager: AgentConfig, analyst: AgentConfig, memo_markdown: str) -> str:
+def _manager_critique_round(
+    run_id: str,
+    manager: AgentConfig,
+    analyst: AgentConfig,
+    memo_markdown: str,
+) -> str:
     system_prompt = f"""
 You are {manager.name}, conducting an adversarial critique.
 Give 3 concise bullets:
@@ -291,6 +320,11 @@ Give 3 concise bullets:
     output = _run_openrouter_chat(
         system_prompt,
         f"Analyst={analyst.name}\n\nMemo:\n{memo_markdown}",
+        run_id=run_id,
+        agent_id=manager.id,
+        agent_name=manager.name,
+        stage="critique",
+        task_label=f"manager critique for {analyst.name}",
     )
     if output:
         return output
@@ -301,27 +335,63 @@ Give 3 concise bullets:
     )
 
 
-def _run_openrouter_chat(system_prompt: str, user_prompt: str) -> str:
+def _run_openrouter_chat(
+    system_prompt: str,
+    user_prompt: str,
+    *,
+    run_id: str | None = None,
+    agent_id: str | None = None,
+    agent_name: str | None = None,
+    stage: str = "review",
+    task_label: str = "OpenRouter request",
+) -> str:
     openrouter_key = _openrouter_key()
     if not openrouter_key:
         return ""
+    timeout_seconds = _openrouter_timeout_seconds()
     client = OpenAI(
         api_key=openrouter_key,
         base_url=_openrouter_base(),
+        timeout=timeout_seconds,
+        max_retries=1,
         default_headers={
             "HTTP-Referer": "https://autoalphapods.local",
             "X-Title": "AutoAlphaPods Orchestrator",
         },
     )
-    completion = client.chat.completions.create(
-        model=_openrouter_model(),
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        max_tokens=900,
-        temperature=0.2,
-    )
+    try:
+        completion = client.chat.completions.create(
+            model=_openrouter_model(),
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            max_tokens=900,
+            temperature=0.2,
+            timeout=timeout_seconds,
+        )
+    except Exception as err:
+        logger.warning(
+            "OpenRouter %s failed for run_id=%s agent_id=%s agent_name=%s: %s",
+            task_label,
+            run_id,
+            agent_id,
+            agent_name,
+            err,
+        )
+        if run_id and agent_id and agent_name:
+            _append_event(
+                run_id,
+                agent_id=agent_id,
+                agent_name=agent_name,
+                stage=stage,
+                message=(
+                    f"{task_label} failed after ~{int(timeout_seconds)}s "
+                    f"({type(err).__name__}). Using fallback."
+                )[:500],
+            )
+        return ""
+
     content = completion.choices[0].message.content or ""
     return content.strip()
 
@@ -340,6 +410,7 @@ def _safe_parse_json_object(text: str) -> dict[str, Any] | None:
 
 
 def _manager_review(
+    run_id: str,
     manager: AgentConfig,
     analyst: AgentConfig,
     memo_markdown: str,
@@ -374,7 +445,15 @@ Memo:
 {memo_markdown}
 """.strip()
 
-    raw = _run_openrouter_chat(system_prompt, user_prompt)
+    raw = _run_openrouter_chat(
+        system_prompt,
+        user_prompt,
+        run_id=run_id,
+        agent_id=manager.id,
+        agent_name=manager.name,
+        stage="review",
+        task_label=f"manager review for {analyst.name}",
+    )
     parsed = _safe_parse_json_object(raw)
     if not parsed:
         return default_review
@@ -514,6 +593,12 @@ def _call_backtest_api_streaming(
         return result_payload
     except Exception:
         # Fallback to non-stream endpoint to preserve functionality if stream parsing fails.
+        logger.exception(
+            "Backtest stream failed for run_id=%s analyst_id=%s analyst_name=%s; falling back to non-stream endpoint.",
+            run_id,
+            analyst.id,
+            analyst.name,
+        )
         _append_event(
             run_id,
             agent_id=manager.id,
@@ -771,7 +856,7 @@ def _run_orchestration_job(run_id: str, payload: dict[str, Any]) -> None:
                 stage="critique",
                 message="Running self-critique pass before manager review...",
             )
-            self_critique = _analyst_self_critique(analyst, memo)
+            self_critique = _analyst_self_critique(run_id, analyst, memo)
             for line in [ln.strip() for ln in self_critique.splitlines() if ln.strip()][:4]:
                 _append_event(
                     run_id,
@@ -789,7 +874,7 @@ def _run_orchestration_job(run_id: str, payload: dict[str, Any]) -> None:
                 stage="critique",
                 message=f"Manager challenge round for {analyst.name}...",
             )
-            manager_critique = _manager_critique_round(manager, analyst, memo)
+            manager_critique = _manager_critique_round(run_id, manager, analyst, memo)
             for line in [ln.strip() for ln in manager_critique.splitlines() if ln.strip()][:4]:
                 _append_event(
                     run_id,
@@ -816,7 +901,7 @@ def _run_orchestration_job(run_id: str, payload: dict[str, Any]) -> None:
                 message="Submitted strategy memo and backtest-ready prompt to manager.",
             )
 
-            review = _manager_review(manager, analyst, memo)
+            review = _manager_review(run_id, manager, analyst, memo)
             time.sleep(0.4)
             _append_event(
                 run_id,
@@ -929,6 +1014,7 @@ def _run_orchestration_job(run_id: str, payload: dict[str, Any]) -> None:
                 run["report_markdown"] = report_markdown
                 run["updated_at"] = _utc_now_iso()
     except Exception as err:
+        logger.exception("Orchestration job failed for run_id=%s", run_id)
         with RUN_STORE_LOCK:
             run = RUN_STORE.get(run_id)
             if run:
