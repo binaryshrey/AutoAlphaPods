@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 import threading
 import uuid
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
@@ -84,6 +85,27 @@ RANGE_MAP = {
     "3M": {"period": "3mo", "interval": "1d"},
     "1Y": {"period": "1y", "interval": "1wk"},
 }
+
+COMMODITY_CONFIG = [
+    {"ticker": "GC=F", "symbol": "XAU", "name": "Gold"},
+    {"ticker": "SI=F", "symbol": "XAG", "name": "Silver"},
+    {"ticker": "CL=F", "symbol": "WTI", "name": "Crude Oil"},
+    {"ticker": "NG=F", "symbol": "NG", "name": "Nat Gas"},
+    {"ticker": "HG=F", "symbol": "HG", "name": "Copper"},
+    {"ticker": "PL=F", "symbol": "XPT", "name": "Platinum"},
+    {"ticker": "ZW=F", "symbol": "ZW", "name": "Wheat"},
+    {"ticker": "ZC=F", "symbol": "ZC", "name": "Corn"},
+    {"ticker": "ZS=F", "symbol": "ZS", "name": "Soybeans"},
+    {"ticker": "KC=F", "symbol": "KC", "name": "Coffee"},
+]
+
+COMMODITY_STRIP_TICKERS = {
+    "commodity-index": "^BCOM",
+    "usd-index": "DX-Y.NYB",
+}
+
+_COMMODITY_CACHE: dict[str, Any] = {"timestamp": 0.0, "payload": None}
+_COMMODITY_CACHE_TTL = 60.0
 
 MACRO_FIELD_NAMES = [
     "yield_1m",
@@ -1027,6 +1049,68 @@ def _run_batch_job_sphinx(job_id: str, request: BatchBacktestRequest):
     jobs[job_id]["errors"] = errors
 
 
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        num = float(value)
+    except Exception:
+        return default
+    if np.isnan(num):
+        return default
+    return num
+
+
+def _fetch_commodity_quote(ticker: str) -> dict[str, Any]:
+    try:
+        yf_ticker = yf.Ticker(ticker)
+        hist = yf_ticker.history(period="1d", interval="30m")
+        fast_info = yf_ticker.fast_info
+    except Exception as exc:
+        return {
+            "price": 0.0,
+            "change_abs": 0.0,
+            "change_pct": 0.0,
+            "history": [],
+            "error": str(exc),
+        }
+
+    closes: list[float] = []
+    if hist is not None and not hist.empty and "Close" in hist.columns:
+        closes = [
+            _safe_float(value, default=None)
+            for value in hist["Close"].tolist()
+            if value is not None
+        ]
+        closes = [v for v in closes if isinstance(v, float)]
+
+    history = closes[-12:]
+
+    def fast_get(key: str, default: float = 0.0) -> float:
+        try:
+            if hasattr(fast_info, "get"):
+                value = fast_info.get(key)
+            else:
+                value = fast_info[key]
+            return _safe_float(value, default)
+        except Exception:
+            return default
+
+    current_price = fast_get("last_price", history[-1] if history else 0.0)
+    previous_close = fast_get(
+        "previous_close",
+        history[-2] if len(history) > 1 else current_price,
+    )
+
+    change_abs = current_price - previous_close
+    change_pct = (change_abs / previous_close * 100) if previous_close else 0.0
+
+    return {
+        "price": _safe_float(current_price, 0.0),
+        "change_abs": _safe_float(change_abs, 0.0),
+        "change_pct": _safe_float(change_pct, 0.0),
+        "history": history,
+    }
+
+
 # ─────────────────────────────────────────────────────────────
 # ROUTES
 # ─────────────────────────────────────────────────────────────
@@ -1125,6 +1209,97 @@ async def yfinance_detail(symbol: str = Query(...), range: str = Query("1D")):
         "prices": prices,
         "asset_type": "equity",
     }
+
+
+@app.get("/yfinance/commodities")
+async def yfinance_commodities():
+    now = time.time()
+    cached = _COMMODITY_CACHE.get("payload")
+    if cached and now - _COMMODITY_CACHE.get("timestamp", 0.0) < _COMMODITY_CACHE_TTL:
+        return cached
+
+    items = []
+    for cfg in COMMODITY_CONFIG:
+        quote = _fetch_commodity_quote(cfg["ticker"])
+        items.append(
+            {
+                "ticker": cfg["ticker"],
+                "symbol": cfg["symbol"],
+                "name": cfg["name"],
+                "price": quote["price"],
+                "changePercent": quote["change_pct"],
+                "changeAbs": quote["change_abs"],
+                "sparkline": quote["history"],
+            }
+        )
+
+    def item_by_symbol(symbol: str) -> Optional[dict[str, Any]]:
+        for item in items:
+            if item["symbol"] == symbol:
+                return item
+        return None
+
+    grains_symbols = ["ZW", "ZC", "ZS"]
+    grains_items = [item_by_symbol(sym) for sym in grains_symbols]
+    grains_items = [item for item in grains_items if item is not None]
+    grains_price = (
+        sum(item["price"] for item in grains_items) / len(grains_items)
+        if grains_items
+        else 0.0
+    )
+    grains_change = (
+        sum(item["changePercent"] for item in grains_items) / len(grains_items)
+        if grains_items
+        else 0.0
+    )
+
+    index_quote = _fetch_commodity_quote(COMMODITY_STRIP_TICKERS["commodity-index"])
+    usd_quote = _fetch_commodity_quote(COMMODITY_STRIP_TICKERS["usd-index"])
+    wti_item = item_by_symbol("WTI")
+    gold_item = item_by_symbol("XAU")
+
+    strip = [
+        {
+            "id": "commodity-index",
+            "label": "Commodity Index",
+            "price": index_quote["price"],
+            "changePercent": index_quote["change_pct"],
+        },
+        {
+            "id": "energy",
+            "label": "Energy (WTI)",
+            "price": wti_item["price"] if wti_item else 0.0,
+            "changePercent": wti_item["changePercent"] if wti_item else 0.0,
+        },
+        {
+            "id": "metals",
+            "label": "Metals (XAU)",
+            "price": gold_item["price"] if gold_item else 0.0,
+            "changePercent": gold_item["changePercent"] if gold_item else 0.0,
+        },
+        {
+            "id": "grains",
+            "label": "Grains",
+            "price": grains_price,
+            "changePercent": grains_change,
+        },
+        {
+            "id": "usd-index",
+            "label": "USD Index",
+            "price": usd_quote["price"],
+            "changePercent": usd_quote["change_pct"],
+        },
+    ]
+
+    payload = {
+        "updated_at": datetime.utcnow().isoformat() + "Z",
+        "items": items,
+        "strip": strip,
+    }
+
+    _COMMODITY_CACHE["timestamp"] = now
+    _COMMODITY_CACHE["payload"] = payload
+    return payload
 
 
 @app.get("/etfs", tags=["Config"])
