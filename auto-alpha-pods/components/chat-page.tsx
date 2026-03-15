@@ -276,14 +276,6 @@ type AlpacaOrderSide = "buy" | "sell";
 type AlpacaOrderType = "market" | "limit";
 type AlpacaTimeInForce = "gtc" | "ioc";
 
-interface SentimentData {
-  value: number;
-  classification: string;
-  label: string;
-  tone: "bearish" | "neutral" | "bullish";
-  timestamp: number;
-}
-
 interface AlpacaConfigResponse {
   configured: boolean;
   orderUrl?: string;
@@ -559,9 +551,6 @@ function MetricPill({ label, value }: { label: string; value: string }) {
 }
 
 function BacktestCard({ data }: { data: BacktestResult }) {
-  const [primaryChart, setPrimaryChart] = useState<
-    "equity" | "drawdown" | "exposure"
-  >("equity");
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [showCode, setShowCode] = useState(false);
 
@@ -570,9 +559,10 @@ function BacktestCard({ data }: { data: BacktestResult }) {
     tickerPositionSeries[0]?.ticker ?? "",
   );
   const activeTicker =
-    selectedTicker && tickerPositionSeries.some((t) => t.ticker === selectedTicker)
+    selectedTicker &&
+    tickerPositionSeries.some((t) => t.ticker === selectedTicker)
       ? selectedTicker
-      : tickerPositionSeries[0]?.ticker ?? "";
+      : (tickerPositionSeries[0]?.ticker ?? "");
 
   const equitySeries = [
     {
@@ -580,31 +570,6 @@ function BacktestCard({ data }: { data: BacktestResult }) {
       data: data.equity_curve.map((point) => [
         new Date(point.date).getTime(),
         point.equity,
-      ]),
-    },
-  ];
-  const drawdownSeries = [
-    {
-      name: "Drawdown %",
-      data: (data.drawdown_curve ?? []).map((point) => [
-        new Date(point.date).getTime(),
-        point.drawdown_pct,
-      ]),
-    },
-  ];
-  const exposureSeries = [
-    {
-      name: "Gross Exposure %",
-      data: (data.exposure_curve ?? []).map((point) => [
-        new Date(point.date).getTime(),
-        point.gross,
-      ]),
-    },
-    {
-      name: "Net Exposure %",
-      data: (data.exposure_curve ?? []).map((point) => [
-        new Date(point.date).getTime(),
-        point.net,
       ]),
     },
   ];
@@ -665,48 +630,37 @@ function BacktestCard({ data }: { data: BacktestResult }) {
     },
   };
 
-  const primarySeries =
-    primaryChart === "equity"
-      ? equitySeries
-      : primaryChart === "drawdown"
-        ? drawdownSeries
-        : exposureSeries;
-
   const primaryOptions = {
     ...baseChartOptions,
+    dataLabels: {
+      enabled: false,
+    },
+    markers: {
+      size: 2,
+    },
     stroke: {
       curve: "smooth" as const,
-      width: primaryChart === "exposure" ? [2, 2] : 2,
+      width: 2,
     },
-    fill:
-      primaryChart === "equity" || primaryChart === "drawdown"
-        ? {
-            type: "gradient" as const,
-            gradient: {
-              shadeIntensity: 1,
-              opacityFrom: 0.3,
-              opacityTo: 0.03,
-              stops: [0, 100],
-            },
-          }
-        : { opacity: 1 },
-    colors:
-      primaryChart === "equity"
-        ? ["#10b981"]
-        : primaryChart === "drawdown"
-          ? ["#f97316"]
-          : ["#38bdf8", "#a78bfa"],
+    fill: {
+      type: "gradient" as const,
+      gradient: {
+        shadeIntensity: 1,
+        opacityFrom: 0.3,
+        opacityTo: 0.03,
+        stops: [0, 100],
+      },
+    },
+    colors: ["#10b981"],
     yaxis: {
       labels: {
         style: { colors: "#6b7280", fontSize: "10px" },
         formatter: (val: number) =>
-          primaryChart === "equity"
-            ? `$${val.toLocaleString("en-US", { maximumFractionDigits: 0 })}`
-            : `${val.toFixed(1)}%`,
+          `$${val.toLocaleString("en-US", { maximumFractionDigits: 0 })}`,
       },
     },
     legend: {
-      show: primaryChart === "exposure",
+      show: false,
       labels: { colors: "#a1a1aa" },
     },
   };
@@ -779,7 +733,9 @@ function BacktestCard({ data }: { data: BacktestResult }) {
             <p className="text-[10px] uppercase tracking-[0.2em] text-zinc-500">
               Backtest Strategy
             </p>
-            <p className="text-sm text-zinc-100 leading-relaxed">{data.prompt}</p>
+            <p className="text-sm text-zinc-100 leading-relaxed">
+              {data.prompt}
+            </p>
           </div>
           <div className="flex flex-wrap gap-2">
             <MetricPill label="Tickers" value={data.tickers} />
@@ -797,40 +753,20 @@ function BacktestCard({ data }: { data: BacktestResult }) {
           <MetricPill label="Win Rate" value={data.win_rate} />
           <MetricPill label="Best Day" value={data.best_day || "—"} />
           <MetricPill label="Worst Day" value={data.worst_day || "—"} />
-          <MetricPill
-            label="Turnover"
-            value={data.avg_daily_turnover || "—"}
-          />
+          <MetricPill label="Turnover" value={data.avg_daily_turnover || "—"} />
         </div>
       </div>
 
       <div className="rounded-xl border border-white/10 bg-black/35 p-4">
         <div className="flex items-center justify-between gap-3 mb-3">
-          <div className="flex items-center gap-2">
-            {(["equity", "drawdown", "exposure"] as const).map((mode) => (
-              <button
-                key={mode}
-                type="button"
-                onClick={() => setPrimaryChart(mode)}
-                className={`px-2.5 py-1 rounded-md text-[11px] border transition-colors ${
-                  primaryChart === mode
-                    ? "bg-white text-black border-white"
-                    : "bg-white/[0.02] text-zinc-400 border-white/12 hover:text-zinc-200 hover:border-white/30"
-                }`}
-              >
-                {mode === "equity"
-                  ? "Equity"
-                  : mode === "drawdown"
-                    ? "Drawdown"
-                    : "Exposure"}
-              </button>
-            ))}
-          </div>
+          <span className="px-2.5 py-1 rounded-md text-[11px] border bg-white text-black border-white">
+            Equity
+          </span>
           <span className="text-[10px] text-zinc-500">Daily</span>
         </div>
         <ReactApexChart
-          type={primaryChart === "equity" ? "area" : "line"}
-          series={primarySeries}
+          type="area"
+          series={equitySeries}
           options={primaryOptions}
           height={250}
         />
@@ -842,7 +778,9 @@ function BacktestCard({ data }: { data: BacktestResult }) {
           onClick={() => setShowAdvanced((prev) => !prev)}
           className="w-full flex items-center justify-between text-xs text-zinc-300 hover:text-white transition-colors"
         >
-          <span>Advanced analytics (positions, rolling Sharpe, model code)</span>
+          <span>
+            Advanced analytics (positions, rolling Sharpe, model code)
+          </span>
           {showAdvanced ? (
             <ChevronUp className="w-3.5 h-3.5" />
           ) : (
@@ -1041,7 +979,9 @@ function BacktestLogPanel({
                 <div ref={logEndRef} />
               </div>
             ) : (
-              <div className="text-zinc-500">Waiting for the first log line…</div>
+              <div className="text-zinc-500">
+                Waiting for the first log line…
+              </div>
             )}
           </div>
         </div>
@@ -1967,7 +1907,6 @@ export default function ChatPageContent() {
   const initialQuery = searchParams.get("q") || "";
 
   const [coins, setCoins] = useState<CoinData[]>([]);
-  const [sentiment, setSentiment] = useState<SentimentData | null>(null);
   const [query, setQuery] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [streaming, setStreaming] = useState(false);
@@ -1975,16 +1914,6 @@ export default function ChatPageContent() {
   const inputRef = useRef<HTMLInputElement>(null);
   const sentInitialRef = useRef(false);
   const prevMessageCountRef = useRef(0);
-
-  // Fetch sentiment
-  useEffect(() => {
-    fetch("/api/sentiment")
-      .then((r) => r.json())
-      .then((data) => {
-        if (data?.tone) setSentiment(data);
-      })
-      .catch(() => {});
-  }, []);
 
   // Fetch market data for sidebar
   useEffect(() => {
@@ -2512,7 +2441,7 @@ export default function ChatPageContent() {
     <div className="min-h-screen bg-[#000000] text-white flex flex-col">
       {/* ── Header ── */}
       <header className="sticky top-0 z-50 border-b border-white/[0.06] bg-[#000000]/95 backdrop-blur-sm">
-        <div className="max-w-7xl mx-auto px-5 h-14 flex items-center justify-between gap-4">
+        <div className="max-w-7xl mx-auto px-5 h-14 flex items-center gap-4">
           <div className="flex items-center gap-3">
             <Link
               href="/dashboard"
@@ -2524,71 +2453,8 @@ export default function ChatPageContent() {
               AutoAlpha<span className="text-zinc-400">Pods</span>
             </span>
           </div>
-          <div className="flex items-center gap-4">
-            {sentiment && (
-              <a
-                href="https://alternative.me/crypto/fear-and-greed-index/"
-                target="_blank"
-                rel="noopener noreferrer"
-                className="flex items-center gap-2.5 hover:opacity-80 transition-opacity cursor-pointer"
-              >
-                <div className="flex items-end gap-[3px] h-7">
-                  {[7, 12, 10, 19, 15, 22, 14, 18, 11, 16, 8, 14].map(
-                    (h, i) => (
-                      <span
-                        key={i}
-                        className="w-[3px] rounded-full"
-                        style={{
-                          height: `${h}px`,
-                          background:
-                            sentiment.tone === "bearish"
-                              ? "#fb7185"
-                              : sentiment.tone === "bullish"
-                                ? "#34d399"
-                                : "#fbbf24",
-                          opacity: 0.55 + (i % 3) * 0.15,
-                          animation: `eqBar ${0.8 + (i % 4) * 0.15}s ease-in-out ${i * 0.07}s infinite alternate`,
-                        }}
-                      />
-                    ),
-                  )}
-                </div>
-                <div className="flex flex-col leading-none gap-1">
-                  <span
-                    className="text-sm font-semibold"
-                    style={{
-                      color:
-                        sentiment.tone === "bearish"
-                          ? "#fb7185"
-                          : sentiment.tone === "bullish"
-                            ? "#34d399"
-                            : "#fbbf24",
-                    }}
-                  >
-                    {sentiment.label}
-                  </span>
-                  <span className="text-sm text-zinc-500">
-                    Crypto<span className="mx-1 text-zinc-700">·</span>
-                    {new Date(sentiment.timestamp).toLocaleDateString("en-US", {
-                      month: "short",
-                      day: "numeric",
-                      year: "numeric",
-                    })}
-                    {", "}EST
-                  </span>
-                </div>
-              </a>
-            )}
-          </div>
         </div>
       </header>
-
-      <style>{`
-        @keyframes eqBar {
-          from { transform: scaleY(0.4); }
-          to   { transform: scaleY(1); }
-        }
-      `}</style>
 
       {/* ── Main layout ── */}
       <div className="flex flex-1 max-w-7xl mx-auto w-full px-5 py-6 gap-6 pb-32">
@@ -2623,8 +2489,11 @@ export default function ChatPageContent() {
                   <div className="flex-1 min-w-0">
                     {msg.backtest || msg.backtestLoading ? (
                       <div className="space-y-3">
-                        {msg.backtest ? <BacktestCard data={msg.backtest} /> : null}
-                        {msg.backtestLoading || (msg.backtestLogs?.length ?? 0) > 0 ? (
+                        {msg.backtest ? (
+                          <BacktestCard data={msg.backtest} />
+                        ) : null}
+                        {msg.backtestLoading ||
+                        (msg.backtestLogs?.length ?? 0) > 0 ? (
                           <BacktestLogPanel
                             logs={msg.backtestLogs ?? []}
                             running={Boolean(msg.backtestLoading)}
@@ -2694,94 +2563,6 @@ export default function ChatPageContent() {
 
           <div ref={chatEndRef} />
         </div>
-
-        {/* ── Market Overview Sidebar ── */}
-        <aside className="hidden lg:block w-72 shrink-0 sticky top-[57px] self-start max-h-[calc(100vh-120px)] overflow-y-auto">
-          <h2 className="text-[10px] font-medium text-zinc-500 uppercase tracking-wider mb-3">
-            Market Overview
-          </h2>
-          <div className="space-y-2">
-            {coins.length === 0
-              ? Array.from({ length: 8 }).map((_, i) => (
-                  <div
-                    key={i}
-                    className="bg-[#0a0a0a] border border-white/[0.07] rounded-xl h-[90px] animate-pulse"
-                  />
-                ))
-              : coins.slice(0, 10).map((coin) => {
-                  const pos = coin.price_change_percentage_24h >= 0;
-                  const changeAbs = Math.abs(coin.price_change_24h ?? 0);
-                  return (
-                    <div
-                      key={coin.id}
-                      onClick={() =>
-                        window.open(
-                          `https://www.coingecko.com/en/coins/${coin.id}`,
-                          "_blank",
-                          "noopener,noreferrer",
-                        )
-                      }
-                      className="bg-[#0a0a0a] border border-white/[0.07] rounded-xl hover:border-white/[0.14] hover:bg-[#111] transition-all overflow-hidden cursor-pointer"
-                    >
-                      <div className="px-3.5 pt-3 pb-1.5">
-                        <div className="flex items-start justify-between gap-2">
-                          <div className="min-w-0 flex items-center gap-2">
-                            {coin.image && (
-                              // eslint-disable-next-line @next/next/no-img-element
-                              <img
-                                src={coin.image}
-                                alt={coin.name}
-                                className="w-5 h-5 rounded-full shrink-0"
-                              />
-                            )}
-                            <div className="min-w-0">
-                              <p className="text-[12px] font-semibold text-white truncate leading-tight">
-                                {coin.name}
-                              </p>
-                              <p className="text-[10px] text-zinc-500 tabular-nums mt-0.5">
-                                {fmt(coin.current_price)}
-                              </p>
-                            </div>
-                          </div>
-                          <div className="text-right shrink-0">
-                            <span
-                              className={`text-[11px] font-semibold flex items-center justify-end gap-0.5 ${
-                                pos ? "text-emerald-400" : "text-red-400"
-                              }`}
-                            >
-                              {pos ? (
-                                <ArrowUpRight className="w-3 h-3" />
-                              ) : (
-                                <ArrowDownRight className="w-3 h-3" />
-                              )}
-                              {Math.abs(
-                                coin.price_change_percentage_24h,
-                              ).toFixed(2)}
-                              %
-                            </span>
-                            <p
-                              className={`text-[10px] font-medium mt-0.5 tabular-nums ${
-                                pos ? "text-emerald-600" : "text-red-600"
-                              }`}
-                            >
-                              {pos ? "+" : "-"}
-                              {fmt(changeAbs)}
-                            </p>
-                          </div>
-                        </div>
-                      </div>
-                      {coin.sparkline_in_7d?.price && (
-                        <CardSparkline
-                          data={coin.sparkline_in_7d.price}
-                          positive={pos}
-                          height={40}
-                        />
-                      )}
-                    </div>
-                  );
-                })}
-          </div>
-        </aside>
       </div>
 
       {/* ── Fixed search bar ── */}
@@ -2828,8 +2609,8 @@ export default function ChatPageContent() {
             </div>
             <p className="text-center text-[10px] text-zinc-700 mt-2">
               <TrendingUp className="w-3 h-3 inline -mt-0.5 mr-1" />
-              Powered by OpenRouter · Market data from CoinGecko, Yahoo Finance &
-              Polymarket
+              Powered by OpenRouter · Market data from CoinGecko, Yahoo Finance
+              & Polymarket
             </p>
           </form>
         </div>

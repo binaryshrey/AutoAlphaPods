@@ -210,6 +210,7 @@ export default function AgentOrchestrationPage() {
   }, [manager, analysts, nodePositions]);
 
   const floorAgents: FloorAgent[] = useMemo(() => {
+    const runSeed = runId ?? "idle";
     const all = [
       {
         id: manager.id,
@@ -227,10 +228,10 @@ export default function AgentOrchestrationPage() {
 
     return all.map((agent, idx) => ({
       ...agent,
-      x: hashToPct(agent.id, 97 + idx, 8, 88),
-      y: hashToPct(agent.id, 193 + idx, 12, 78),
+      x: hashToPct(`${agent.id}-${runSeed}`, 97 + idx, 8, 88),
+      y: hashToPct(`${agent.id}-${runSeed}`, 193 + idx, 12, 78),
     }));
-  }, [analysts, manager]);
+  }, [analysts, manager, runId]);
 
   const latestByAgent = useMemo(() => {
     const map = new Map<string, OrchestrationEvent>();
@@ -583,7 +584,7 @@ export default function AgentOrchestrationPage() {
 
             <div
               ref={mapCanvasRef}
-              className={`group relative h-[360px] rounded-xl border border-white/8 bg-[radial-gradient(circle_at_top,rgba(16,185,129,0.12),transparent_45%),radial-gradient(circle_at_bottom,rgba(56,189,248,0.09),transparent_45%)] overflow-hidden ${
+              className={`group relative h-[360px] rounded-xl border border-white/8 bg-[#050505] overflow-hidden ${
                 isCanvasPanning ? "cursor-grabbing" : "cursor-grab"
               }`}
               onPointerDown={handleCanvasPointerDown}
@@ -796,7 +797,6 @@ export default function AgentOrchestrationPage() {
                     style={{
                       left: `${agent.x}%`,
                       top: `${agent.y}%`,
-                      animation: `floorBob ${1.4 + (idx % 3) * 0.45}s ease-in-out ${idx * 0.15}s infinite alternate`,
                     }}
                     onClick={() => {
                       if (hasResult) setReportOpen(true);
@@ -911,13 +911,6 @@ export default function AgentOrchestrationPage() {
           </div>
         </aside>
       )}
-
-      <style>{`
-        @keyframes floorBob {
-          from { transform: translate(-50%, -52%); }
-          to { transform: translate(-50%, -46%); }
-        }
-      `}</style>
     </div>
   );
 }
