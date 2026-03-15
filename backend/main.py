@@ -1,5 +1,6 @@
 import warnings
 import asyncio
+import inspect
 import json
 import logging
 import queue
@@ -40,7 +41,8 @@ from routers.equity import router as equity_router
 
 SUPABASE_URL    = os.getenv("SUPABASE_URL")
 SUPABASE_KEY    = os.getenv("SUPABASE_KEY")
-TABLE_NAME      = os.getenv("TABLE_NAME", "fi_macro_data")
+MACRO_TABLE_NAME = os.getenv("MACRO_TABLE_NAME", os.getenv("TABLE_NAME", "fi_macro_data"))
+COMMODITY_TABLE_NAME = os.getenv("COMMODITY_TABLE_NAME", "commodity_price_bars")
 OPENROUTER_KEY  = os.getenv("OPENROUTER_KEY")
 OPENROUTER_BASE = os.getenv("OPENROUTER_BASE", "https://openrouter.ai/api/v1")
 MODEL           = os.getenv("MODEL", "anthropic/claude-sonnet-4-5")
@@ -70,6 +72,13 @@ INTERNATIONAL (%): usd_broad, bund_10y, jgb_10y, gilt_10y
 FISCAL: fed_debt, deficit
 """
 
+COMMODITY_BAR_COLUMNS = """
+MULTIINDEX: timestamp, symbol
+IDENTITY: source, asset_class, universe, category, instrument_name
+PRICE BARS: open, high, low, close, adj_close
+FLOW / CORPORATE ACTIONS: volume, dividends, capital_gains, stock_splits
+"""
+
 ETF_UNIVERSE = """
 FIXED INCOME: TLT IEF SHY TIP AGG LQD HYG JNK MBB MUB EMB TBT
 COMMODITIES:  GLD SLV USO CPER DJP
@@ -80,6 +89,29 @@ ALL_ETFS = [
     "TLT","IEF","SHY","TIP","AGG","LQD","HYG","JNK",
     "MBB","MUB","EMB","TBT","GLD","SLV","USO","CPER",
     "DJP","SPY","QQQ","XLF","XLU","XLV","XLP","VNQ","XLE",
+]
+
+COMMODITY_NUMERIC_FIELDS = [
+    "open",
+    "high",
+    "low",
+    "close",
+    "adj_close",
+    "volume",
+    "dividends",
+    "capital_gains",
+    "stock_splits",
+]
+
+COMMODITY_SELECT_FIELDS = [
+    "timestamp",
+    "symbol",
+    "source",
+    "asset_class",
+    "universe",
+    "category",
+    "instrument_name",
+    *COMMODITY_NUMERIC_FIELDS,
 ]
 
 RANGE_MAP = {
@@ -163,30 +195,6 @@ MACRO_FIELD_NAMES = [
     "deficit",
 ]
 
-SYSTEM_PROMPT = f"""You are a quantitative researcher at a hedge fund.
-Translate the plain-English trading strategy into a Python function.
-
-Available DataFrames:
-- `macro`: daily macro data, DatetimeIndex. Columns:
-{MACRO_COLUMNS}
-
-- `prices`: daily ETF closes, DatetimeIndex. Available ETFs:
-{ETF_UNIVERSE}
-
-Write ONLY a function called `generate_signals(macro, prices)` that returns:
-- pd.DataFrame with DatetimeIndex
-- Columns = tickers (e.g. "TLT", "GLD")
-- Values = float weights (1.0=long, -1.0=short, 0=flat)
-
-Hard rules:
-1. Raw Python only — no imports, no markdown fences, no explanation
-2. pandas=pd and numpy=np are already available — never import them
-3. Use .shift(1) on ALL signals to prevent look-ahead bias
-4. Handle NaN with .fillna(0)
-5. Return a DataFrame, never a Series
-6. Since the strategy uses daily time series, the positions are also expected on a daily granularity
-"""
-
 SPHINX_OUTPUT_CODE_BLOCK = re.compile(r"```(?:python)?\s*(.*?)```", re.DOTALL)
 
 
@@ -204,6 +212,9 @@ jobs: dict[str, dict] = {}
 
 _cached_macro_all: Optional[pd.DataFrame] = None
 _cached_macro_by_columns: dict[tuple[str, ...], pd.DataFrame] = {}
+_cached_commodity_all: Optional[pd.DataFrame] = None
+_cached_commodity_by_symbols: dict[tuple[str, ...], pd.DataFrame] = {}
+_cached_commodity_prices_all: Optional[pd.DataFrame] = None
 
 
 async def preload_macro():
@@ -220,9 +231,24 @@ async def preload_macro():
     )
 
 
+async def preload_commodity():
+    global _cached_commodity_all
+    if _cached_commodity_all is not None:
+        return
+    logger.info("Preloading commodity data from Supabase.")
+    loop = asyncio.get_event_loop()
+    _cached_commodity_all = await loop.run_in_executor(None, _load_commodity_sync)
+    logger.info(
+        "Commodity data ready: %s rows across %s symbols",
+        f"{len(_cached_commodity_all):,}",
+        len(_cached_commodity_all.index.get_level_values("symbol").unique()),
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await preload_macro()
+    await preload_commodity()
     yield
 
 
@@ -322,12 +348,61 @@ def _normalize_macro_columns(columns: Optional[list[str]]) -> tuple[str, ...]:
     return tuple(requested)
 
 
+def _normalize_commodity_symbols(symbols: Optional[list[str]]) -> tuple[str, ...]:
+    if not symbols:
+        return tuple()
+    requested = sorted({symbol for symbol in symbols if symbol})
+    return tuple(requested)
+
+
 def _infer_macro_columns(code: str) -> list[str]:
     referenced = []
     for column in MACRO_FIELD_NAMES:
         if f"'{column}'" in code or f'"{column}"' in code:
             referenced.append(column)
     return sorted(set(referenced)) or MACRO_FIELD_NAMES.copy()
+
+
+def _build_system_prompt() -> str:
+    commodity_summary = _get_commodity_universe_summary()
+    commodity_symbols = ", ".join(commodity_summary["symbols"]) or "(none loaded)"
+    category_summary = ", ".join(commodity_summary["categories"]) or "(none loaded)"
+
+    return f"""You are a quantitative researcher at a hedge fund.
+Translate the plain-English trading strategy into a Python function.
+
+Available DataFrames:
+- `macro`: daily macro data, DatetimeIndex. Columns:
+{MACRO_COLUMNS}
+
+- `prices`: daily close matrix for tradable assets referenced by your strategy, DatetimeIndex.
+  ETFs available by default:
+{ETF_UNIVERSE}
+  Commodity symbols also available in `prices`:
+  {commodity_symbols}
+
+- `commodities`: daily commodity price-bar table with MultiIndex (`timestamp`, `symbol`). Columns:
+{COMMODITY_BAR_COLUMNS}
+  Available categories: {category_summary}
+  Use exact `symbol` values from `commodities` when trading commodity instruments.
+
+Write ONLY a function called `generate_signals`.
+Preferred signature: `generate_signals(macro, prices, commodities)`
+Backwards-compatible alternative: `generate_signals(macro, prices)`
+
+Return:
+- pd.DataFrame with DatetimeIndex
+- Columns = tradable tickers/symbols present in `prices` (e.g. "TLT", "GLD", "GC=F", "CL=F")
+- Values = float weights (1.0=long, -1.0=short, 0=flat)
+
+Hard rules:
+1. Raw Python only — no imports, no markdown fences, no explanation
+2. pandas=pd and numpy=np are already available — never import them
+3. Use .shift(1) on ALL signals to prevent look-ahead bias
+4. Handle NaN with .fillna(0)
+5. Return a DataFrame, never a Series
+6. Since the strategy uses daily time series, the positions are also expected on a daily granularity
+"""
 
 
 def _load_macro_sync(columns: Optional[list[str]] = None) -> pd.DataFrame:
@@ -337,7 +412,7 @@ def _load_macro_sync(columns: Optional[list[str]] = None) -> pd.DataFrame:
     select_clause = ",".join(["date", *requested])
     while True:
         res = (
-            client.table(TABLE_NAME)
+            client.table(MACRO_TABLE_NAME)
             .select(select_clause)
             .gte("date", START)
             .lte("date", END)
@@ -383,12 +458,110 @@ def _get_macro_sync(columns: Optional[list[str]] = None) -> pd.DataFrame:
     return macro
 
 
-def _load_prices_sync(tickers: list, start: str, end: str) -> pd.DataFrame:
+def _load_commodity_sync(symbols: Optional[list[str]] = None) -> pd.DataFrame:
+    client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    rows, page, limit = [], 0, 5000
+    requested_symbols = list(_normalize_commodity_symbols(symbols))
+    select_clause = ",".join(COMMODITY_SELECT_FIELDS)
+
+    while True:
+        query = (
+            client.table(COMMODITY_TABLE_NAME)
+            .select(select_clause)
+            .gte("timestamp", START)
+            .lte("timestamp", END)
+            .order("timestamp")
+            .order("symbol")
+        )
+        if requested_symbols:
+            query = query.in_("symbol", requested_symbols)
+        res = query.range(page * limit, (page + 1) * limit - 1).execute()
+        batch = res.data
+        if not batch:
+            break
+        rows.extend(batch)
+        if len(batch) < limit:
+            break
+        page += 1
+
+    if not rows:
+        empty = pd.DataFrame(columns=COMMODITY_SELECT_FIELDS)
+        empty["timestamp"] = pd.to_datetime(pd.Series(dtype="datetime64[ns]"))
+        return empty.set_index(["timestamp", "symbol"]).sort_index()
+
+    df = pd.DataFrame(rows)
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    for col in COMMODITY_NUMERIC_FIELDS:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df.set_index(["timestamp", "symbol"]).sort_index()
+
+
+def _get_commodity_sync(symbols: Optional[list[str]] = None) -> pd.DataFrame:
+    global _cached_commodity_all
+
+    cache_key = _normalize_commodity_symbols(symbols)
+    if cache_key in _cached_commodity_by_symbols:
+        return _cached_commodity_by_symbols[cache_key]
+
+    if _cached_commodity_all is not None:
+        if not cache_key:
+            return _cached_commodity_all
+        mask = _cached_commodity_all.index.get_level_values("symbol").isin(cache_key)
+        subset = _cached_commodity_all.loc[mask].copy()
+        _cached_commodity_by_symbols[cache_key] = subset
+        return subset
+
+    commodity = _load_commodity_sync(list(cache_key) if cache_key else None)
+    if not cache_key:
+        _cached_commodity_all = commodity
+    _cached_commodity_by_symbols[cache_key] = commodity
+    return commodity
+
+
+def _get_commodity_prices_sync(symbols: Optional[list[str]] = None) -> pd.DataFrame:
+    global _cached_commodity_prices_all
+
+    requested_symbols = list(_normalize_commodity_symbols(symbols))
+    if requested_symbols:
+        commodity = _get_commodity_sync(requested_symbols)
+        if commodity.empty:
+            return pd.DataFrame()
+        return commodity["close"].unstack("symbol").sort_index()
+
+    if _cached_commodity_prices_all is not None:
+        return _cached_commodity_prices_all
+
+    commodity = _get_commodity_sync()
+    if commodity.empty:
+        _cached_commodity_prices_all = pd.DataFrame()
+    else:
+        _cached_commodity_prices_all = commodity["close"].unstack("symbol").sort_index()
+    return _cached_commodity_prices_all
+
+
+def _get_commodity_universe_summary() -> dict[str, list[str]]:
+    commodity = _get_commodity_sync()
+    if commodity.empty:
+        return {"symbols": [], "categories": [], "asset_classes": [], "universes": []}
+
+    return {
+        "symbols": sorted(commodity.index.get_level_values("symbol").unique().tolist()),
+        "categories": sorted(commodity["category"].dropna().unique().tolist()),
+        "asset_classes": sorted(commodity["asset_class"].dropna().unique().tolist()),
+        "universes": sorted(commodity["universe"].dropna().unique().tolist()),
+    }
+
+
+def _load_yfinance_prices_sync(tickers: list[str], start: str, end: str) -> pd.DataFrame:
+    if not tickers:
+        return pd.DataFrame()
     raw = yf.download(
         tickers, start=start, end=end,
         auto_adjust=True, progress=False,
         group_by="ticker"
     )
+    if raw is None or raw.empty:
+        return pd.DataFrame()
     if isinstance(raw.columns, pd.MultiIndex):
         closes = raw.xs("Close", axis=1, level=1)
     else:
@@ -396,6 +569,48 @@ def _load_prices_sync(tickers: list, start: str, end: str) -> pd.DataFrame:
         closes = raw[[col]].rename(columns={col: tickers[0]})
     closes.columns = [str(c) for c in closes.columns]
     return closes.sort_index()
+
+
+def _infer_referenced_assets(code: str) -> list[str]:
+    commodity_symbols = _get_commodity_universe_summary()["symbols"]
+    candidates = [*ALL_ETFS, *commodity_symbols]
+    referenced = [ticker for ticker in candidates if f'"{ticker}"' in code or f"'{ticker}'" in code]
+    if referenced:
+        return list(dict.fromkeys(referenced))
+    return ["TLT", "HYG", "GLD", "SPY", "TIP", "SHY"]
+
+
+def _load_prices_sync(tickers: list[str], start: str, end: str) -> pd.DataFrame:
+    requested = list(dict.fromkeys([ticker for ticker in tickers if ticker]))
+    if not requested:
+        return pd.DataFrame()
+
+    commodity_symbols = set(_get_commodity_universe_summary()["symbols"])
+    commodity_tickers = [ticker for ticker in requested if ticker in commodity_symbols]
+    market_tickers = [ticker for ticker in requested if ticker not in commodity_symbols]
+
+    frames: list[pd.DataFrame] = []
+    if market_tickers:
+        market_prices = _load_yfinance_prices_sync(market_tickers, start, end)
+        if not market_prices.empty:
+            frames.append(market_prices)
+
+    if commodity_tickers:
+        commodity_prices = _get_commodity_prices_sync(commodity_tickers)
+        if not commodity_prices.empty:
+            commodity_prices = commodity_prices.loc[
+                (commodity_prices.index >= pd.to_datetime(start))
+                & (commodity_prices.index <= pd.to_datetime(end))
+            ]
+            frames.append(commodity_prices)
+
+    if not frames:
+        return pd.DataFrame()
+
+    prices = pd.concat(frames, axis=1).sort_index()
+    prices = prices.loc[:, ~prices.columns.duplicated()]
+    available = [ticker for ticker in requested if ticker in prices.columns]
+    return prices[available]
 
 
 def _emit_stream_event(stream_log: StreamLogFn, event: str, **payload: Any) -> None:
@@ -424,6 +639,7 @@ def _stream_log(
 
 
 def _ask_llm_sync(prompt: str, model: str, stream_log: StreamLogFn = None) -> str:
+    system_prompt = _build_system_prompt()
     _stream_log(
         stream_log,
         f"Requesting strategy code from model {model}.",
@@ -441,7 +657,7 @@ def _ask_llm_sync(prompt: str, model: str, stream_log: StreamLogFn = None) -> st
         model=model,
         max_tokens=2000,
         messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user",   "content": prompt},
         ],
     )
@@ -619,7 +835,7 @@ def _ensure_sphinx_ready(stream_log: StreamLogFn = None) -> None:
 
 def _ask_sphinx_sync(user_prompt: str, stream_log: StreamLogFn = None) -> str:
     _ensure_sphinx_ready(stream_log)
-    prompt = f"{SYSTEM_PROMPT}\n\nTrading strategy:\n{user_prompt}"
+    prompt = f"{_build_system_prompt()}\n\nTrading strategy:\n{user_prompt}"
 
     keep_notebooks = os.getenv("SPHINX_KEEP_NOTEBOOKS", "").lower() in {"1", "true", "yes"}
     explicit_notebook = os.getenv("SPHINX_NOTEBOOK_FILEPATH")
@@ -681,7 +897,12 @@ def _ask_sphinx_sync(user_prompt: str, stream_log: StreamLogFn = None) -> str:
     return code
 
 
-def _execute_strategy(code: str, macro: pd.DataFrame, prices: pd.DataFrame) -> pd.DataFrame:
+def _execute_strategy(
+    code: str,
+    macro: pd.DataFrame,
+    prices: pd.DataFrame,
+    commodities: pd.DataFrame,
+) -> pd.DataFrame:
     namespace = {"pd": pd, "np": np}
     try:
         exec(code, namespace)
@@ -689,8 +910,24 @@ def _execute_strategy(code: str, macro: pd.DataFrame, prices: pd.DataFrame) -> p
         raise RuntimeError(f"Compile error: {e}\n\nCode:\n{code}") from e
     if "generate_signals" not in namespace:
         raise RuntimeError(f"No generate_signals() function found in generated code.\n\nCode:\n{code}")
+    generate_signals = namespace["generate_signals"]
     try:
-        signals = namespace["generate_signals"](macro.copy(), prices.copy())
+        signature = inspect.signature(generate_signals)
+        positional_params = [
+            param for param in signature.parameters.values()
+            if param.kind in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            )
+        ]
+        has_varargs = any(
+            param.kind == inspect.Parameter.VAR_POSITIONAL
+            for param in signature.parameters.values()
+        )
+        if has_varargs or len(positional_params) >= 3:
+            signals = generate_signals(macro.copy(), prices.copy(), commodities.copy())
+        else:
+            signals = generate_signals(macro.copy(), prices.copy())
     except Exception as e:
         raise RuntimeError(f"Runtime error in generate_signals(): {e}\n\nCode:\n{code}") from e
     if not isinstance(signals, pd.DataFrame):
@@ -875,9 +1112,9 @@ def _run_single_backtest(
         columns=macro_columns,
     )
     macro = _get_macro_sync(macro_columns)
-    referenced = [t for t in ALL_ETFS if f'"{t}"' in code or f"'{t}'" in code]
-    if not referenced:
-        referenced = ["TLT", "HYG", "GLD", "SPY", "TIP", "SHY"]
+    _stream_log(stream_log, "Loading commodity data.", stage="load_commodities")
+    commodities = _get_commodity_sync()
+    referenced = _infer_referenced_assets(code)
 
     _stream_log(
         stream_log,
@@ -889,7 +1126,7 @@ def _run_single_backtest(
     )
     prices  = _load_prices_sync(referenced, start, end)
     _stream_log(stream_log, "Executing generated strategy.", stage="execute_strategy")
-    signals = _execute_strategy(code, macro, prices)
+    signals = _execute_strategy(code, macro, prices, commodities)
 
     _stream_log(stream_log, "Simulating portfolio.", stage="simulate_portfolio")
     port_returns, equity, weights, aligned_prices = _simulate_portfolio(
@@ -951,9 +1188,9 @@ def _run_single_backtest_sphinx(
         columns=macro_columns,
     )
     macro = _get_macro_sync(macro_columns)
-    referenced = [t for t in ALL_ETFS if f'"{t}"' in code or f"'{t}'" in code]
-    if not referenced:
-        referenced = ["TLT", "HYG", "GLD", "SPY", "TIP", "SHY"]
+    _stream_log(stream_log, "Loading commodity data.", stage="load_commodities")
+    commodities = _get_commodity_sync()
+    referenced = _infer_referenced_assets(code)
 
     _stream_log(
         stream_log,
@@ -965,7 +1202,7 @@ def _run_single_backtest_sphinx(
     )
     prices = _load_prices_sync(referenced, start, end)
     _stream_log(stream_log, "Executing generated strategy.", stage="execute_strategy")
-    signals = _execute_strategy(code, macro, prices)
+    signals = _execute_strategy(code, macro, prices, commodities)
 
     _stream_log(stream_log, "Simulating portfolio.", stage="simulate_portfolio")
     port_returns, equity, weights, px = _simulate_portfolio(signals, prices, initial_cash)
@@ -1166,7 +1403,7 @@ def _fetch_commodity_quote(ticker: str) -> dict[str, Any]:
 @app.get("/", tags=["Health"])
 def root():
     return {
-        "service" : "FI Backtest Engine",
+        "service" : "FI + Commodity Backtest Engine",
         "status"  : "running",
         "model"   : MODEL,
         "data_range": f"{START} → {END}",
@@ -1176,10 +1413,13 @@ def root():
 @app.get("/health", tags=["Health"])
 def health():
     macro = _cached_macro_all
+    commodity = _cached_commodity_all
     return {
-        "status"      : "ok",
-        "macro_loaded": macro is not None,
-        "macro_rows"  : len(macro) if macro is not None else 0,
+        "status"          : "ok",
+        "macro_loaded"    : macro is not None,
+        "macro_rows"      : len(macro) if macro is not None else 0,
+        "commodity_loaded": commodity is not None,
+        "commodity_rows"  : len(commodity) if commodity is not None else 0,
     }
 
 
@@ -1357,6 +1597,26 @@ def list_etfs():
     return {"etfs": ALL_ETFS}
 
 
+@app.get("/commodities/symbols", tags=["Config"])
+def list_commodity_symbols():
+    summary = _get_commodity_universe_summary()
+    commodity = _get_commodity_sync()
+    symbols: list[dict[str, Any]] = []
+    for symbol in summary["symbols"]:
+        rows = commodity.xs(symbol, level="symbol", drop_level=False)
+        latest = rows.iloc[-1]
+        symbols.append(
+            {
+                "symbol": symbol,
+                "instrument_name": latest.get("instrument_name"),
+                "category": latest.get("category"),
+                "asset_class": latest.get("asset_class"),
+                "universe": latest.get("universe"),
+            }
+        )
+    return {"symbols": symbols}
+
+
 @app.get("/macro/columns", tags=["Config"])
 def list_macro_columns():
     try:
@@ -1379,6 +1639,26 @@ def macro_snapshot():
     return {
         "date"  : str(latest.name.date()),
         "values": {k: round(float(v), 4) for k, v in latest.items()},
+    }
+
+
+@app.get("/commodities/snapshot", tags=["Data"])
+def commodity_snapshot():
+    try:
+        commodity = _get_commodity_sync()
+    except Exception as e:
+        logger.exception("Commodity snapshot request failed.")
+        raise HTTPException(503, str(e))
+
+    if commodity.empty:
+        return {"date": None, "rows": []}
+
+    latest_date = commodity.index.get_level_values("timestamp").max()
+    latest_rows = commodity.xs(latest_date, level="timestamp", drop_level=False).reset_index()
+    latest_rows = latest_rows.sort_values(["category", "instrument_name", "symbol"])
+    return {
+        "date": str(pd.Timestamp(latest_date).date()),
+        "rows": latest_rows.to_dict(orient="records"),
     }
 
 
