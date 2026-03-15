@@ -2617,14 +2617,13 @@ export default function ChatPageContent() {
                   <div className="flex-1 min-w-0">
                     {msg.backtest || msg.backtestLoading ? (
                       <div className="space-y-3">
-                        {msg.backtest ? (
-                          <BacktestCard data={msg.backtest} />
-                        ) : (
+                        {msg.backtest ? <BacktestCard data={msg.backtest} /> : null}
+                        {msg.backtestLoading || (msg.backtestLogs?.length ?? 0) > 0 ? (
                           <BacktestLogPanel
                             logs={msg.backtestLogs ?? []}
                             running={Boolean(msg.backtestLoading)}
                           />
-                        )}
+                        ) : null}
                       </div>
                     ) : msg.coinCard ? (
                       <div className="space-y-3">
