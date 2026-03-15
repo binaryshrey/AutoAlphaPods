@@ -907,6 +907,7 @@ def _run_single_backtest_sphinx(
         port_returns,
         equity,
         weights,
+        px,
         prompt,
         tickers=signals.columns.tolist(),
         code=code,
