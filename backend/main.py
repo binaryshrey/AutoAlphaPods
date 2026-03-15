@@ -196,6 +196,8 @@ MACRO_FIELD_NAMES = [
 ]
 
 SPHINX_OUTPUT_CODE_BLOCK = re.compile(r"```(?:python)?\s*(.*?)```", re.DOTALL)
+MONTH_END_RESAMPLE_RE = re.compile(r"(\.resample\(\s*)(['\"])M\2")
+MONTH_END_FREQ_RE = re.compile(r"(freq\s*=\s*)(['\"])M\2")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -473,8 +475,33 @@ Hard rules:
 3. Use .shift(1) on ALL signals to prevent look-ahead bias
 4. Handle NaN with .fillna(0)
 5. Return a DataFrame, never a Series
-6. Since the strategy uses daily time series, the positions are also expected on a daily granularity
+6. If you need month-end resampling, use `.resample('ME').last()` or `freq='ME'` for pandas 3 compatibility. Never use `'M'`.
+7. Since the strategy uses daily time series, the positions are also expected on a daily granularity. If you build monthly signals, reindex/forward-fill them back to the daily prices index before returning.
 """
+
+
+def _normalize_generated_code_for_pandas(
+    code: str,
+    stream_log: StreamLogFn = None,
+) -> str:
+    normalized = code
+    changes: list[str] = []
+
+    updated = MONTH_END_RESAMPLE_RE.sub(r"\1\2ME\2", normalized)
+    if updated != normalized:
+        normalized = updated
+        changes.append("Normalized `.resample('M')` to `.resample('ME')` for pandas 3 compatibility.")
+
+    updated = MONTH_END_FREQ_RE.sub(r"\1\2ME\2", normalized)
+    if updated != normalized:
+        normalized = updated
+        changes.append("Normalized `freq='M'` to `freq='ME'` for pandas 3 compatibility.")
+
+    for message in changes:
+        logger.warning(message)
+        _stream_log(stream_log, message, stage="execute_strategy", level="warning")
+
+    return normalized
 
 
 def _load_macro_sync(columns: Optional[list[str]] = None) -> pd.DataFrame:
@@ -1083,7 +1110,9 @@ def _execute_strategy(
     macro: pd.DataFrame,
     prices: pd.DataFrame,
     commodities: pd.DataFrame,
+    stream_log: StreamLogFn = None,
 ) -> pd.DataFrame:
+    code = _normalize_generated_code_for_pandas(code, stream_log=stream_log)
     logger.info(
         "Executing strategy. macro_rows=%s macro_cols=%s macro_range=%s price_rows=%s price_cols=%s price_range=%s commodity_rows=%s commodity_symbols=%s",
         len(macro),
@@ -1403,7 +1432,7 @@ def _run_single_backtest(
         **_summarize_price_frame(prices),
     )
     _stream_log(stream_log, "Executing generated strategy.", stage="execute_strategy")
-    signals = _execute_strategy(code, macro, prices, commodities)
+    signals = _execute_strategy(code, macro, prices, commodities, stream_log=stream_log)
     _stream_log(
         stream_log,
         "Strategy execution produced signals.",
@@ -1525,7 +1554,7 @@ def _run_single_backtest_sphinx(
         **_summarize_price_frame(prices),
     )
     _stream_log(stream_log, "Executing generated strategy.", stage="execute_strategy")
-    signals = _execute_strategy(code, macro, prices, commodities)
+    signals = _execute_strategy(code, macro, prices, commodities, stream_log=stream_log)
     _stream_log(
         stream_log,
         "Strategy execution produced signals.",
