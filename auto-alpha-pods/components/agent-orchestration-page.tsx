@@ -1,7 +1,8 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
+import Image from "next/image";
 import {
   ArrowLeft,
   Download,
@@ -100,11 +101,26 @@ const defaultAnalysts: AgentConfig[] = [
   },
 ];
 
+const PIXEL_SPRITES = [
+  "https://raw.githubusercontent.com/binaryshrey/Orchestral-AI/main/orchestral-ai/public/pixel-agents/char_0.png",
+  "https://raw.githubusercontent.com/binaryshrey/Orchestral-AI/main/orchestral-ai/public/pixel-agents/char_1.png",
+  "https://raw.githubusercontent.com/binaryshrey/Orchestral-AI/main/orchestral-ai/public/pixel-agents/char_2.png",
+  "https://raw.githubusercontent.com/binaryshrey/Orchestral-AI/main/orchestral-ai/public/pixel-agents/char_3.png",
+  "https://raw.githubusercontent.com/binaryshrey/Orchestral-AI/main/orchestral-ai/public/pixel-agents/char_4.png",
+  "https://raw.githubusercontent.com/binaryshrey/Orchestral-AI/main/orchestral-ai/public/pixel-agents/char_5.png",
+];
+const PIXEL_SPRITE_COLUMNS = 7;
+const PIXEL_SPRITE_ROWS = 3;
+const PIXEL_STANDING_COLUMN = 1;
+const PIXEL_STANDING_ROW = 0;
+const PIXEL_AGENT_WIDTH = 56;
+const PIXEL_AGENT_HEIGHT = 112;
+
 function hashToPct(id: string, salt: number, min: number, max: number): number {
   let h = salt;
   for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) >>> 0;
   const span = max - min;
-  return min + (h % 1000) / 1000 * span;
+  return min + ((h % 1000) / 1000) * span;
 }
 
 function stageTone(stage: string): string {
@@ -131,8 +147,40 @@ export default function AgentOrchestrationPage() {
   const [runData, setRunData] = useState<OrchestrationRun | null>(null);
   const [runError, setRunError] = useState<string | null>(null);
   const [reportOpen, setReportOpen] = useState(false);
+  const [nodePositions, setNodePositions] = useState<
+    Record<string, { x: number; y: number }>
+  >(() => {
+    const positions: Record<string, { x: number; y: number }> = {
+      [defaultManager.id]: { x: 50, y: 17 },
+    };
+    const spacing = 100 / (defaultAnalysts.length + 1);
+    defaultAnalysts.forEach((analyst, idx) => {
+      positions[analyst.id] = { x: spacing * (idx + 1), y: 72 };
+    });
+    return positions;
+  });
+  const [canvasOffset, setCanvasOffset] = useState({ x: 0, y: 0 });
+  const [isCanvasPanning, setIsCanvasPanning] = useState(false);
+  const [draggingNodeId, setDraggingNodeId] = useState<string | null>(null);
+  const mapCanvasRef = useRef<HTMLDivElement | null>(null);
+  const canvasPanRef = useRef<{
+    startX: number;
+    startY: number;
+    originX: number;
+    originY: number;
+  } | null>(null);
+  const nodeDragRef = useRef<{
+    nodeId: string;
+    startX: number;
+    startY: number;
+    originX: number;
+    originY: number;
+    width: number;
+    height: number;
+  } | null>(null);
 
-  const selectedRole: Role = selectedNodeId === "manager" ? "manager" : "analyst";
+  const selectedRole: Role =
+    selectedNodeId === "manager" ? "manager" : "analyst";
   const selectedAgent =
     selectedNodeId === "manager"
       ? manager
@@ -144,8 +192,8 @@ export default function AgentOrchestrationPage() {
       role: "manager" as const,
       name: manager.name,
       specialization: manager.specialization,
-      x: 50,
-      y: 17,
+      x: nodePositions[manager.id]?.x ?? 50,
+      y: nodePositions[manager.id]?.y ?? 17,
     };
     const analystNodes = analysts.map((analyst, idx) => {
       const spacing = 100 / (analysts.length + 1);
@@ -154,12 +202,12 @@ export default function AgentOrchestrationPage() {
         role: "analyst" as const,
         name: analyst.name,
         specialization: analyst.specialization,
-        x: spacing * (idx + 1),
-        y: 72,
+        x: nodePositions[analyst.id]?.x ?? spacing * (idx + 1),
+        y: nodePositions[analyst.id]?.y ?? 72,
       };
     });
     return { managerNode, analystNodes };
-  }, [manager, analysts]);
+  }, [manager, analysts, nodePositions]);
 
   const floorAgents: FloorAgent[] = useMemo(() => {
     const all = [
@@ -213,12 +261,15 @@ export default function AgentOrchestrationPage() {
         const payload = (await res.json()) as OrchestrationRun;
         if (cancelled) return;
         setRunData(payload);
-        if (payload.status === "completed" || payload.status === "failed") return;
+        if (payload.status === "completed" || payload.status === "failed")
+          return;
         setTimeout(poll, 1200);
       } catch (err) {
         if (!cancelled) {
           setRunError(
-            err instanceof Error ? err.message : "Failed to poll orchestration run.",
+            err instanceof Error
+              ? err.message
+              : "Failed to poll orchestration run.",
           );
           setTimeout(poll, 2000);
         }
@@ -229,6 +280,133 @@ export default function AgentOrchestrationPage() {
       cancelled = true;
     };
   }, [runId]);
+
+  useEffect(() => {
+    setNodePositions((prev) => {
+      const next: Record<string, { x: number; y: number }> = {
+        [manager.id]: prev[manager.id] ?? { x: 50, y: 17 },
+      };
+      const spacing = 100 / (analysts.length + 1);
+      analysts.forEach((analyst, idx) => {
+        next[analyst.id] = prev[analyst.id] ?? {
+          x: spacing * (idx + 1),
+          y: 72,
+        };
+      });
+      return next;
+    });
+  }, [analysts, manager.id]);
+
+  useEffect(() => {
+    if (!isCanvasPanning) return;
+
+    const onPointerMove = (event: PointerEvent) => {
+      const start = canvasPanRef.current;
+      if (!start) return;
+      setCanvasOffset({
+        x: start.originX + (event.clientX - start.startX),
+        y: start.originY + (event.clientY - start.startY),
+      });
+    };
+
+    const stopPanning = () => {
+      setIsCanvasPanning(false);
+      canvasPanRef.current = null;
+    };
+
+    window.addEventListener("pointermove", onPointerMove);
+    window.addEventListener("pointerup", stopPanning);
+
+    return () => {
+      window.removeEventListener("pointermove", onPointerMove);
+      window.removeEventListener("pointerup", stopPanning);
+    };
+  }, [isCanvasPanning]);
+
+  useEffect(() => {
+    if (!draggingNodeId) return;
+
+    const onPointerMove = (event: PointerEvent) => {
+      const drag = nodeDragRef.current;
+      if (!drag) return;
+
+      const nextX =
+        drag.originX + ((event.clientX - drag.startX) / drag.width) * 100;
+      const nextY =
+        drag.originY + ((event.clientY - drag.startY) / drag.height) * 100;
+
+      setNodePositions((prev) => ({
+        ...prev,
+        [drag.nodeId]: {
+          x: Math.min(94, Math.max(6, nextX)),
+          y: Math.min(92, Math.max(8, nextY)),
+        },
+      }));
+    };
+
+    const stopDragging = () => {
+      setDraggingNodeId(null);
+      nodeDragRef.current = null;
+    };
+
+    window.addEventListener("pointermove", onPointerMove);
+    window.addEventListener("pointerup", stopDragging);
+
+    return () => {
+      window.removeEventListener("pointermove", onPointerMove);
+      window.removeEventListener("pointerup", stopDragging);
+    };
+  }, [draggingNodeId]);
+
+  const handleCanvasPointerDown = (
+    event: React.PointerEvent<HTMLDivElement>,
+  ) => {
+    if (event.button !== 0) return;
+    const target = event.target as HTMLElement;
+    if (target.closest("button")) return;
+    event.preventDefault();
+
+    canvasPanRef.current = {
+      startX: event.clientX,
+      startY: event.clientY,
+      originX: canvasOffset.x,
+      originY: canvasOffset.y,
+    };
+    setIsCanvasPanning(true);
+  };
+
+  const handleNodePointerDown = (
+    event: React.PointerEvent<HTMLButtonElement>,
+    nodeId: string,
+  ) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+
+    const rect = mapCanvasRef.current?.getBoundingClientRect();
+    if (!rect || rect.width <= 0 || rect.height <= 0) return;
+
+    const origin =
+      nodePositions[nodeId] ??
+      (nodeId === manager.id ? { x: 50, y: 17 } : { x: 50, y: 72 });
+
+    nodeDragRef.current = {
+      nodeId,
+      startX: event.clientX,
+      startY: event.clientY,
+      originX: origin.x,
+      originY: origin.y,
+      width: rect.width,
+      height: rect.height,
+    };
+
+    setSelectedNodeId(nodeId);
+    setDraggingNodeId(nodeId);
+  };
+
+  const resetCanvasPosition = () => {
+    setCanvasOffset({ x: 0, y: 0 });
+  };
 
   const updateSelectedAgent = (
     field: keyof AgentConfig,
@@ -366,7 +544,8 @@ export default function AgentOrchestrationPage() {
                 Objective
               </p>
               <p className="text-sm text-zinc-300 mt-1">
-                Configure analysts, manager, and run adversarial strategy orchestration.
+                Configure analysts, manager, and run adversarial strategy
+                orchestration.
               </p>
             </div>
             {runId && (
@@ -390,7 +569,7 @@ export default function AgentOrchestrationPage() {
           <div className="rounded-2xl border border-white/10 bg-[#0a0b12] p-4">
             <div className="flex items-center justify-between mb-3">
               <p className="text-xs uppercase tracking-wider text-zinc-500">
-                Agent Map (Figma-like)
+                Agent Map
               </p>
               <button
                 type="button"
@@ -402,83 +581,122 @@ export default function AgentOrchestrationPage() {
               </button>
             </div>
 
-            <div className="relative h-[360px] rounded-xl border border-white/8 bg-[radial-gradient(circle_at_top,rgba(16,185,129,0.12),transparent_45%),radial-gradient(circle_at_bottom,rgba(56,189,248,0.09),transparent_45%)] overflow-hidden">
-              <svg className="absolute inset-0 w-full h-full">
-                <defs>
-                  <marker
-                    id="flowArrow"
-                    viewBox="0 0 10 10"
-                    refX="9"
-                    refY="5"
-                    markerWidth="5"
-                    markerHeight="5"
-                    orient="auto-start-reverse"
-                  >
-                    <path d="M 0 0 L 10 5 L 0 10 z" fill="#a1a1aa" />
-                  </marker>
-                </defs>
-                {figmaNodes.analystNodes.map((node) => (
-                  <line
-                    key={`edge-${node.id}`}
-                    x1={`${node.x}%`}
-                    y1={`${node.y - 8}%`}
-                    x2={`${figmaNodes.managerNode.x}%`}
-                    y2={`${figmaNodes.managerNode.y + 7}%`}
-                    stroke="rgba(161,161,170,0.6)"
-                    strokeWidth="1.2"
-                    strokeDasharray="4 4"
-                    markerEnd="url(#flowArrow)"
-                  />
-                ))}
-              </svg>
-
-              <button
-                type="button"
-                onClick={() => setSelectedNodeId("manager")}
-                className={`absolute -translate-x-1/2 -translate-y-1/2 w-44 rounded-xl border px-3 py-2 text-left transition-all ${
-                  selectedNodeId === "manager"
-                    ? "border-emerald-300/80 bg-emerald-300/15 shadow-[0_0_30px_rgba(16,185,129,0.25)]"
-                    : "border-white/18 bg-black/45 hover:border-white/35"
-                }`}
+            <div
+              ref={mapCanvasRef}
+              className={`group relative h-[360px] rounded-xl border border-white/8 bg-[radial-gradient(circle_at_top,rgba(16,185,129,0.12),transparent_45%),radial-gradient(circle_at_bottom,rgba(56,189,248,0.09),transparent_45%)] overflow-hidden ${
+                isCanvasPanning ? "cursor-grabbing" : "cursor-grab"
+              }`}
+              onPointerDown={handleCanvasPointerDown}
+            >
+              <div
+                className="absolute inset-0 opacity-40"
                 style={{
-                  left: `${figmaNodes.managerNode.x}%`,
-                  top: `${figmaNodes.managerNode.y}%`,
+                  backgroundImage:
+                    "radial-gradient(circle, rgba(161,161,170,0.45) 1px, transparent 1px)",
+                  backgroundSize: "24px 24px",
+                  backgroundPosition: `${canvasOffset.x}px ${canvasOffset.y}px`,
+                }}
+              />
+
+              <div
+                className="absolute inset-0"
+                style={{
+                  transform: `translate(${canvasOffset.x}px, ${canvasOffset.y}px)`,
                 }}
               >
-                <p className="text-[10px] uppercase tracking-wide text-emerald-300">
-                  Manager
-                </p>
-                <p className="text-sm font-semibold text-zinc-100 truncate">
-                  {manager.name}
-                </p>
-                <p className="text-[11px] text-zinc-400 truncate">
-                  {manager.specialization}
-                </p>
-              </button>
+                <svg className="absolute inset-0 w-full h-full">
+                  <defs>
+                    <marker
+                      id="flowArrow"
+                      viewBox="0 0 10 10"
+                      refX="9"
+                      refY="5"
+                      markerWidth="5"
+                      markerHeight="5"
+                      orient="auto-start-reverse"
+                    >
+                      <path d="M 0 0 L 10 5 L 0 10 z" fill="#a1a1aa" />
+                    </marker>
+                  </defs>
+                  {figmaNodes.analystNodes.map((node) => (
+                    <line
+                      key={`edge-${node.id}`}
+                      x1={`${node.x}%`}
+                      y1={`${node.y - 8}%`}
+                      x2={`${figmaNodes.managerNode.x}%`}
+                      y2={`${figmaNodes.managerNode.y + 7}%`}
+                      stroke="rgba(161,161,170,0.6)"
+                      strokeWidth="1.2"
+                      strokeDasharray="4 4"
+                      markerEnd="url(#flowArrow)"
+                    />
+                  ))}
+                </svg>
 
-              {figmaNodes.analystNodes.map((node) => (
                 <button
                   type="button"
-                  key={node.id}
-                  onClick={() => setSelectedNodeId(node.id)}
+                  onClick={() => setSelectedNodeId("manager")}
+                  onPointerDown={(event) =>
+                    handleNodePointerDown(event, "manager")
+                  }
                   className={`absolute -translate-x-1/2 -translate-y-1/2 w-44 rounded-xl border px-3 py-2 text-left transition-all ${
-                    selectedNodeId === node.id
-                      ? "border-sky-300/70 bg-sky-300/10 shadow-[0_0_24px_rgba(56,189,248,0.2)]"
-                      : "border-white/15 bg-black/45 hover:border-white/30"
+                    selectedNodeId === "manager"
+                      ? "border-emerald-300/80 bg-emerald-300/15 shadow-[0_0_30px_rgba(16,185,129,0.25)]"
+                      : "border-white/18 bg-black/45 hover:border-white/35"
                   }`}
-                  style={{ left: `${node.x}%`, top: `${node.y}%` }}
+                  style={{
+                    left: `${figmaNodes.managerNode.x}%`,
+                    top: `${figmaNodes.managerNode.y}%`,
+                  }}
                 >
-                  <p className="text-[10px] uppercase tracking-wide text-sky-300">
-                    Analyst
+                  <p className="text-[10px] uppercase tracking-wide text-emerald-300">
+                    Manager
                   </p>
                   <p className="text-sm font-semibold text-zinc-100 truncate">
-                    {node.name}
+                    {manager.name}
                   </p>
                   <p className="text-[11px] text-zinc-400 truncate">
-                    {node.specialization}
+                    {manager.specialization}
                   </p>
                 </button>
-              ))}
+
+                {figmaNodes.analystNodes.map((node) => (
+                  <button
+                    type="button"
+                    key={node.id}
+                    onClick={() => setSelectedNodeId(node.id)}
+                    onPointerDown={(event) =>
+                      handleNodePointerDown(event, node.id)
+                    }
+                    className={`absolute -translate-x-1/2 -translate-y-1/2 w-44 rounded-xl border px-3 py-2 text-left transition-all ${
+                      selectedNodeId === node.id
+                        ? "border-sky-300/70 bg-sky-300/10 shadow-[0_0_24px_rgba(56,189,248,0.2)]"
+                        : "border-white/15 bg-black/45 hover:border-white/30"
+                    }`}
+                    style={{ left: `${node.x}%`, top: `${node.y}%` }}
+                  >
+                    <p className="text-[10px] uppercase tracking-wide text-sky-300">
+                      Analyst
+                    </p>
+                    <p className="text-sm font-semibold text-zinc-100 truncate">
+                      {node.name}
+                    </p>
+                    <p className="text-[11px] text-zinc-400 truncate">
+                      {node.specialization}
+                    </p>
+                  </button>
+                ))}
+              </div>
+
+              {(canvasOffset.x !== 0 || canvasOffset.y !== 0) && (
+                <button
+                  type="button"
+                  onClick={resetCanvasPosition}
+                  className="absolute right-2 top-2 rounded-md border border-white/15 bg-black/55 px-2 py-1 text-[10px] text-zinc-300 hover:text-white hover:border-white/30"
+                >
+                  Reset View
+                </button>
+              )}
             </div>
           </div>
 
@@ -544,7 +762,79 @@ export default function AgentOrchestrationPage() {
           </div>
         </section>
 
-        <section className="grid grid-cols-1 xl:grid-cols-[1fr_1fr] gap-5">
+        <section className="space-y-5">
+          <div className="rounded-2xl border border-white/10 bg-[#0a0b12] p-4">
+            <div className="flex items-center justify-between mb-3">
+              <div className="flex items-center gap-2">
+                <Sparkles className="w-4 h-4 text-amber-300" />
+                <p className="text-xs uppercase tracking-wider text-zinc-500">
+                  Trading Floor Agents
+                </p>
+              </div>
+              <span className="text-[11px] text-zinc-500">
+                {runData?.status || "idle"}
+              </span>
+            </div>
+            <div className="relative w-full aspect-[16/9] rounded-xl border border-white/8 overflow-hidden">
+              <Image
+                src="/trading_floor.png"
+                alt="Trading floor"
+                fill
+                className="object-contain"
+                draggable={false}
+                sizes="100vw"
+              />
+              {floorAgents.map((agent, idx) => {
+                const latest = latestByAgent.get(agent.id);
+                const hasResult = resultAgents.has(agent.id);
+                const sprite = PIXEL_SPRITES[idx % PIXEL_SPRITES.length];
+                return (
+                  <button
+                    key={agent.id}
+                    type="button"
+                    className="group absolute -translate-x-1/2 -translate-y-1/2"
+                    style={{
+                      left: `${agent.x}%`,
+                      top: `${agent.y}%`,
+                      animation: `floorBob ${1.4 + (idx % 3) * 0.45}s ease-in-out ${idx * 0.15}s infinite alternate`,
+                    }}
+                    onClick={() => {
+                      if (hasResult) setReportOpen(true);
+                    }}
+                  >
+                    <div className="relative mx-auto w-fit">
+                      <span
+                        role="img"
+                        aria-label={agent.name}
+                        className="block [image-rendering:pixelated]"
+                        style={{
+                          width: `${PIXEL_AGENT_WIDTH}px`,
+                          height: `${PIXEL_AGENT_HEIGHT}px`,
+                          backgroundImage: `url(${sprite})`,
+                          backgroundRepeat: "no-repeat",
+                          backgroundSize: `${PIXEL_SPRITE_COLUMNS * 100}% ${PIXEL_SPRITE_ROWS * 100}%`,
+                          backgroundPosition: `${(PIXEL_STANDING_COLUMN / (PIXEL_SPRITE_COLUMNS - 1)) * 100}% ${(PIXEL_STANDING_ROW / (PIXEL_SPRITE_ROWS - 1)) * 100}%`,
+                        }}
+                      />
+                      {hasResult && (
+                        <span className="absolute -right-1.5 -top-1.5 h-2.5 w-2.5 rounded-full bg-amber-300 border border-amber-100" />
+                      )}
+                    </div>
+                    <div className="absolute left-1/2 -translate-x-1/2 -mt-2 text-[10px] text-zinc-200 whitespace-nowrap">
+                      {agent.name}
+                    </div>
+                    {latest && (
+                      <div className="pointer-events-none opacity-0 group-hover:opacity-100 transition-opacity absolute left-1/2 -translate-x-1/2 -mt-14 w-52 rounded-md border border-white/20 bg-black/90 px-2 py-1 text-[10px] text-zinc-300 text-left">
+                        <p className="text-zinc-100">{latest.agent_name}</p>
+                        <p className="text-zinc-400 mt-0.5">{latest.message}</p>
+                      </div>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
           <div className="rounded-2xl border border-white/10 bg-[#0a0b12] p-4">
             <div className="flex items-center gap-2 mb-3">
               <Terminal className="w-4 h-4 text-emerald-300" />
@@ -562,7 +852,9 @@ export default function AgentOrchestrationPage() {
                   <div
                     key={event.id}
                     className={`leading-relaxed ${
-                      event.stage === "sphinx_cli" ? "opacity-85 text-[10px]" : ""
+                      event.stage === "sphinx_cli"
+                        ? "opacity-85 text-[10px]"
+                        : ""
                     }`}
                   >
                     <span className="text-zinc-600">
@@ -576,71 +868,6 @@ export default function AgentOrchestrationPage() {
                   </div>
                 ))
               )}
-            </div>
-          </div>
-
-          <div className="rounded-2xl border border-white/10 bg-[#0a0b12] p-4">
-            <div className="flex items-center justify-between mb-3">
-              <div className="flex items-center gap-2">
-                <Sparkles className="w-4 h-4 text-amber-300" />
-                <p className="text-xs uppercase tracking-wider text-zinc-500">
-                  Trading Floor (hover agents)
-                </p>
-              </div>
-              <span className="text-[11px] text-zinc-500">
-                {runData?.status || "idle"}
-              </span>
-            </div>
-            <div className="relative h-[320px] rounded-xl border border-white/8 overflow-hidden bg-black">
-              <div
-                className="absolute inset-0 opacity-55"
-                style={{
-                  backgroundImage: "url('/trading_floor.png')",
-                  backgroundSize: "cover",
-                  backgroundPosition: "center",
-                }}
-              />
-              <div className="absolute inset-0 bg-linear-to-b from-black/20 via-black/35 to-black/70" />
-              {floorAgents.map((agent, idx) => {
-                const latest = latestByAgent.get(agent.id);
-                const hasResult = resultAgents.has(agent.id);
-                return (
-                  <button
-                    key={agent.id}
-                    type="button"
-                    className="group absolute -translate-x-1/2 -translate-y-1/2"
-                    style={{
-                      left: `${agent.x}%`,
-                      top: `${agent.y}%`,
-                      animation: `floorBob ${1.4 + (idx % 3) * 0.45}s ease-in-out ${idx * 0.15}s infinite alternate`,
-                    }}
-                    onClick={() => {
-                      if (hasResult) setReportOpen(true);
-                    }}
-                  >
-                    <div
-                      className={`relative h-5 w-5 border ${
-                        agent.role === "manager"
-                          ? "bg-emerald-300 border-emerald-100"
-                          : "bg-sky-300 border-sky-100"
-                      } shadow-[0_0_14px_rgba(255,255,255,0.35)]`}
-                    >
-                      {hasResult && (
-                        <span className="absolute -right-1.5 -top-1.5 h-2.5 w-2.5 rounded-full bg-amber-300 border border-amber-100" />
-                      )}
-                    </div>
-                    <div className="absolute left-1/2 -translate-x-1/2 mt-1 text-[10px] text-zinc-200 whitespace-nowrap">
-                      {agent.name}
-                    </div>
-                    {latest && (
-                      <div className="pointer-events-none opacity-0 group-hover:opacity-100 transition-opacity absolute left-1/2 -translate-x-1/2 mt-6 w-52 rounded-md border border-white/20 bg-black/90 px-2 py-1 text-[10px] text-zinc-300 text-left">
-                        <p className="text-zinc-100">{latest.agent_name}</p>
-                        <p className="text-zinc-400 mt-0.5">{latest.message}</p>
-                      </div>
-                    )}
-                  </button>
-                );
-              })}
             </div>
           </div>
         </section>
