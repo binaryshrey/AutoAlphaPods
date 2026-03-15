@@ -14,7 +14,7 @@ import {
 
 const ORCHESTRATION_API_BASE =
   process.env.NEXT_PUBLIC_BACKTEST_API_BASE_URL?.replace(/\/$/, "") ||
-  "http://localhost:8000";
+  "https://autoalphapods-1.onrender.com";
 
 type Role = "manager" | "analyst";
 
