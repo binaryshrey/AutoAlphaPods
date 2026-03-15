@@ -217,7 +217,7 @@ export default function HeroSection() {
                     <HeroVideoDialog
                       className=" dark:block"
                       animationStyle="from-center"
-                      videoSrc="https://www.youtube.com/embed/qh3NGpYRG3I?si=4rb-zSdDkVK9qxxb"
+                      videoSrc="https://www.youtube.com/embed/u9Wx1UbOTt0?si=4rb-zSdDkVK9qxxb"
                       thumbnailSrc="/image.png"
                       thumbnailAlt="Hero Video"
                     />
