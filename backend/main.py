@@ -643,6 +643,42 @@ def _load_yfinance_prices_sync(tickers: list[str], start: str, end: str) -> pd.D
     return closes.sort_index()
 
 
+def _filter_price_history_window(
+    prices: pd.DataFrame,
+    start: Optional[str],
+    end: Optional[str],
+) -> pd.DataFrame:
+    if prices.empty:
+        return prices
+
+    window = prices
+    if start:
+        window = window.loc[window.index >= pd.to_datetime(start)]
+    if end:
+        window = window.loc[window.index <= pd.to_datetime(end)]
+    return window
+
+
+def _tickers_missing_price_history(
+    prices: pd.DataFrame,
+    tickers: list[str],
+    minimum_rows: int = 2,
+) -> list[str]:
+    if not tickers:
+        return []
+    if prices.empty:
+        return tickers.copy()
+
+    missing: list[str] = []
+    for ticker in tickers:
+        if ticker not in prices.columns:
+            missing.append(ticker)
+            continue
+        if int(prices[ticker].dropna().shape[0]) < minimum_rows:
+            missing.append(ticker)
+    return missing
+
+
 def _infer_referenced_assets(code: str) -> list[str]:
     commodity_symbols = _get_commodity_universe_summary()["symbols"]
     candidates = [*ALL_ETFS, *commodity_symbols]
@@ -694,10 +730,7 @@ def _load_prices_sync(tickers: list[str], start: str, end: str) -> pd.DataFrame:
             commodity_tickers,
         )
         if not commodity_prices.empty:
-            commodity_prices = commodity_prices.loc[
-                (commodity_prices.index >= pd.to_datetime(start))
-                & (commodity_prices.index <= pd.to_datetime(end))
-            ]
+            commodity_prices = _filter_price_history_window(commodity_prices, start, end)
             logger.info(
                 "Commodity price range filtered. rows=%s cols=%s range=%s tickers=%s",
                 len(commodity_prices),
@@ -705,7 +738,37 @@ def _load_prices_sync(tickers: list[str], start: str, end: str) -> pd.DataFrame:
                 _format_index_date_range(commodity_prices.index),
                 commodity_tickers,
             )
-            frames.append(commodity_prices)
+
+        missing_commodity_tickers = _tickers_missing_price_history(
+            commodity_prices,
+            commodity_tickers,
+        )
+        if missing_commodity_tickers:
+            logger.warning(
+                "Commodity price cache missing requested window; falling back to yfinance. "
+                "requested_range=%s -> %s cache_range=%s fallback_tickers=%s",
+                start,
+                end,
+                _format_index_date_range(commodity_prices.index),
+                missing_commodity_tickers,
+            )
+            commodity_fallback_prices = _load_yfinance_prices_sync(
+                missing_commodity_tickers,
+                start,
+                end,
+            )
+            logger.info(
+                "Commodity fallback load complete. rows=%s cols=%s range=%s tickers=%s",
+                len(commodity_fallback_prices),
+                len(commodity_fallback_prices.columns),
+                _format_index_date_range(commodity_fallback_prices.index),
+                missing_commodity_tickers,
+            )
+            if not commodity_fallback_prices.empty:
+                commodity_prices = commodity_prices.combine_first(commodity_fallback_prices)
+                commodity_prices = commodity_prices.sort_index()
+
+        frames.append(commodity_prices)
 
     if not frames:
         logger.warning(
