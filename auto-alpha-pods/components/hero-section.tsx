@@ -118,7 +118,7 @@ export default function HeroSection() {
                       speedSegment={0.3}
                       as="span"
                     >
-                      {"Scenario-Driven AI Agents,"}
+                      {"Scenario Driven AI Agents,"}
                     </TextEffect>
                     <br />
                     <TextEffect
@@ -147,9 +147,9 @@ export default function HeroSection() {
                     as="p"
                     className="mx-auto mt-8 max-w-7xl text-balance text-lg dark:text-gray-300"
                   >
-                    Autonomous AI trading agents that genetically evolve across
-                    generations, learn from market regimes, and execute paper
-                    trades, turning chaos into predictable alpha.
+                    Autonomous AI trading agents that propose, discuss and
+                    execute trading strategies, turning chaos into predictable
+                    alpha.
                   </TextEffect>
 
                   <AnimatedGroup
@@ -188,7 +188,7 @@ export default function HeroSection() {
                       className="h-10.5 rounded-xl px-5"
                     >
                       <Link
-                        href="https://github.com/FalseMarkets/FalseMarkets"
+                        href="https://github.com/binaryshrey/AutoAlphaPods"
                         target="_blank"
                         rel="noopener noreferrer"
                       >

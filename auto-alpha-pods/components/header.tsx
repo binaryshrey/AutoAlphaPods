@@ -7,10 +7,15 @@ import React from "react";
 import { cn } from "@/lib/utils";
 
 const menuItems = [
-  { name: "Github", href: "https://github.com/FalseMarkets/FalseMarkets" },
-  { name: "Features", href: "#link" },
-  { name: "Status", href: "#link" },
-  { name: "Contact", href: "#link" },
+  { name: "Github", href: "https://github.com/binaryshrey/AutoAlphaPods" },
+  {
+    name: "Features",
+    href: "https://github.com/binaryshrey/AutoAlphaPods/blob/main/README.md",
+  },
+  {
+    name: "Contact",
+    href: "https://github.com/binaryshrey/AutoAlphaPods/issues",
+  },
 ];
 
 export const HeroHeader = () => {

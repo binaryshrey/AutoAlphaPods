@@ -1698,19 +1698,14 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
 
 
 def _fetch_commodity_quote(ticker: str) -> dict[str, Any]:
+    hist = None
+    fast_info = None
     try:
         yf_ticker = yf.Ticker(ticker)
         hist = yf_ticker.history(period="1d", interval="30m")
         fast_info = yf_ticker.fast_info
     except Exception as exc:
         logger.warning("Commodity quote fetch failed for ticker=%s: %s", ticker, exc)
-        return {
-            "price": 0.0,
-            "change_abs": 0.0,
-            "change_pct": 0.0,
-            "history": [],
-            "error": str(exc),
-        }
 
     closes: list[float] = []
     if hist is not None and not hist.empty and "Close" in hist.columns:
@@ -1725,6 +1720,8 @@ def _fetch_commodity_quote(ticker: str) -> dict[str, Any]:
 
     def fast_get(key: str, default: float = 0.0) -> float:
         try:
+            if fast_info is None:
+                return default
             if hasattr(fast_info, "get"):
                 value = fast_info.get(key)
             else:
@@ -1738,6 +1735,42 @@ def _fetch_commodity_quote(ticker: str) -> dict[str, Any]:
         "previous_close",
         history[-2] if len(history) > 1 else current_price,
     )
+
+    if not current_price and not history:
+        try:
+            import requests
+
+            chart_url = (
+                f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
+                "?range=5d&interval=30m&includePrePost=false"
+            )
+            res = requests.get(
+                chart_url,
+                headers={"User-Agent": "FalseMarkets/1.0"},
+                timeout=10,
+            )
+            if res.ok:
+                payload = res.json()
+                result = payload.get("chart", {}).get("result", [])
+                if result:
+                    closes = (
+                        result[0]
+                        .get("indicators", {})
+                        .get("quote", [{}])[0]
+                        .get("close", [])
+                    )
+                    closes = [
+                        _safe_float(v, default=None)
+                        for v in closes
+                        if v is not None
+                    ]
+                    closes = [v for v in closes if isinstance(v, float)]
+                    history = closes[-12:]
+                    if history:
+                        current_price = history[-1]
+                        previous_close = history[-2] if len(history) > 1 else current_price
+        except Exception as exc:
+            logger.warning("Commodity chart fallback failed for ticker=%s: %s", ticker, exc)
 
     change_abs = current_price - previous_close
     change_pct = (change_abs / previous_close * 100) if previous_close else 0.0
@@ -1903,18 +1936,11 @@ async def yfinance_commodities():
         else 0.0
     )
 
-    index_quote = _fetch_commodity_quote(COMMODITY_STRIP_TICKERS["commodity-index"])
     usd_quote = _fetch_commodity_quote(COMMODITY_STRIP_TICKERS["usd-index"])
     wti_item = item_by_symbol("WTI")
     gold_item = item_by_symbol("XAU")
 
     strip = [
-        {
-            "id": "commodity-index",
-            "label": "Commodity Index",
-            "price": index_quote["price"],
-            "changePercent": index_quote["change_pct"],
-        },
         {
             "id": "energy",
             "label": "Energy (WTI)",

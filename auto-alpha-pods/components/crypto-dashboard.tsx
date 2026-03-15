@@ -424,16 +424,46 @@ function fmtBps(value: number): string {
   return `${sign}${Math.abs(value).toFixed(1)} bps`;
 }
 
+const CACHE_TTL_MARKET = 60_000;
+const CACHE_TTL_NEWS = 300_000;
+const CACHE_PREFIX = "dashboard-cache:";
+
+function readCache<T>(key: string, maxAgeMs: number): T | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = window.localStorage.getItem(`${CACHE_PREFIX}${key}`);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as { ts: number; data: T };
+    if (!parsed?.ts) return null;
+    if (Date.now() - parsed.ts > maxAgeMs) return null;
+    return parsed.data ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function writeCache<T>(key: string, data: T) {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(
+      `${CACHE_PREFIX}${key}`,
+      JSON.stringify({ ts: Date.now(), data }),
+    );
+  } catch {
+    // ignore cache write errors
+  }
+}
+
 const EQUITY_UP = "#27ae60";
 const EQUITY_DOWN = "#c0392b";
 
 const DEFAULT_POSITION_NOTIONAL = 100;
 
 const ASSET_TABS = [
-  { label: "Crypto", value: "crypto" },
-  { label: "Fixed Income", value: "fixed-income" },
-  { label: "Equity", value: "equity" },
   { label: "Commodity", value: "commodity" },
+  { label: "Crypto", value: "crypto" },
+  { label: "Equity", value: "equity" },
+  { label: "Fixed Income", value: "fixed-income" },
 ] as const;
 
 const COMMODITY_META: Record<
@@ -505,10 +535,10 @@ const COMMODITY_META: Record<
 type AssetTab = (typeof ASSET_TABS)[number]["value"];
 
 function normalizeAssetTab(value: string | null): AssetTab {
-  if (!value) return "crypto";
+  if (!value) return "commodity";
   const normalized = value.toLowerCase();
   const match = ASSET_TABS.find((tab) => tab.value === normalized);
-  return match?.value ?? "crypto";
+  return match?.value ?? "commodity";
 }
 
 function formatQtyFromNotional(
@@ -1901,7 +1931,7 @@ export default function CryptoDashboard() {
   const updateAssetTab = useCallback(
     (next: AssetTab) => {
       const params = new URLSearchParams(searchParams.toString());
-      if (next === "crypto") {
+      if (next === "commodity") {
         params.delete("asset");
       } else {
         params.set("asset", next);
@@ -1919,6 +1949,19 @@ export default function CryptoDashboard() {
     else setRefreshing(true);
 
     try {
+      const cached = readCache<{
+        markets?: CoinData[];
+        global?: { data?: GlobalData };
+        pred?: PredictionMarket[];
+        sent?: SentimentData;
+      }>("crypto", CACHE_TTL_MARKET);
+      if (cached) {
+        if (Array.isArray(cached.markets)) setCoins(cached.markets);
+        if (cached.global?.data) setGlobalData(cached.global.data);
+        if (Array.isArray(cached.pred)) setPredictions(cached.pred);
+        if (cached.sent?.tone) setSentiment(cached.sent);
+      }
+
       const [marketsRes, globalRes, predRes, sentRes] = await Promise.all([
         fetch(
           "/api/crypto?endpoint=coins/markets&vs_currency=usd&order=market_cap_desc&per_page=20&page=1&sparkline=true&price_change_percentage=24h",
@@ -1939,6 +1982,8 @@ export default function CryptoDashboard() {
       if (global?.data) setGlobalData(global.data);
       if (Array.isArray(pred)) setPredictions(pred);
       if (sent?.tone) setSentiment(sent);
+
+      writeCache("crypto", { markets, global, pred, sent });
     } catch (e) {
       console.error("Data fetch error:", e);
     } finally {
@@ -1954,6 +1999,20 @@ export default function CryptoDashboard() {
 
       try {
         if (activeAsset === "fixed-income") {
+          const cached = readCache<{
+            cards?: FixedIncomeCard[];
+            curve?: FixedIncomeCurve;
+            spreads?: FixedIncomeSpread[];
+            strip?: FixedIncomeStripItem[];
+            news?: FixedIncomeNewsItem[];
+          }>("fixed-income", CACHE_TTL_MARKET);
+          if (cached) {
+            setFixedIncomeCards(cached.cards ?? []);
+            setFixedIncomeCurve(cached.curve ?? null);
+            setFixedIncomeSpreads(cached.spreads ?? []);
+            setFixedIncomeStrip(cached.strip ?? []);
+            setFixedIncomeNews(cached.news ?? []);
+          }
           const res = await fetch("/api/fixed-income");
           if (!res.ok) throw new Error(`${res.status}`);
           const payload = (await res.json()) as {
@@ -1997,6 +2056,13 @@ export default function CryptoDashboard() {
             : [];
           setFixedIncomeStrip(strip);
           setFixedIncomeNews(Array.isArray(payload.news) ? payload.news : []);
+          writeCache("fixed-income", {
+            cards,
+            curve: payload.curve ?? null,
+            spreads,
+            strip,
+            news: Array.isArray(payload.news) ? payload.news : [],
+          });
           setAssetItems([]);
           setCommodityItems([]);
           setCommodityStrip([]);
@@ -2007,6 +2073,22 @@ export default function CryptoDashboard() {
           setEquityEarnings([]);
           setEquityNews([]);
         } else if (activeAsset === "equity") {
+          const cached = readCache<{
+            cards?: EquityCard[];
+            sectors?: EquitySector[];
+            indicators?: EquityIndicator[];
+            strip?: EquityStripItem[];
+            earnings?: EquityEarningRow[];
+            news?: EquityNewsItem[];
+          }>("equity", CACHE_TTL_MARKET);
+          if (cached) {
+            setEquityCards(cached.cards ?? []);
+            setEquitySectors(cached.sectors ?? []);
+            setEquityIndicators(cached.indicators ?? []);
+            setEquityStrip(cached.strip ?? []);
+            setEquityEarnings(cached.earnings ?? []);
+            setEquityNews(cached.news ?? []);
+          }
           const res = await fetch("/api/equity-dashboard");
           if (!res.ok) throw new Error(`${res.status}`);
           const payload = (await res.json()) as {
@@ -2074,6 +2156,14 @@ export default function CryptoDashboard() {
             : [];
           setEquityEarnings(earnings);
           setEquityNews(Array.isArray(payload.news) ? payload.news : []);
+          writeCache("equity", {
+            cards,
+            sectors,
+            indicators,
+            strip,
+            earnings,
+            news: Array.isArray(payload.news) ? payload.news : [],
+          });
           setAssetItems([]);
           setCommodityItems([]);
           setCommodityStrip([]);
@@ -2083,6 +2173,14 @@ export default function CryptoDashboard() {
           setFixedIncomeStrip([]);
           setFixedIncomeNews([]);
         } else if (activeAsset === "commodity") {
+          const cached = readCache<{
+            items?: CommodityItem[];
+            strip?: CommodityStripItem[];
+          }>("commodity", CACHE_TTL_MARKET);
+          if (cached) {
+            setCommodityItems(cached.items ?? []);
+            setCommodityStrip(cached.strip ?? []);
+          }
           const res = await fetch("/api/commodities");
           if (!res.ok) throw new Error(`${res.status}`);
           const payload = (await res.json()) as {
@@ -2093,13 +2191,28 @@ export default function CryptoDashboard() {
           else setCommodityItems([]);
           if (Array.isArray(payload.strip)) setCommodityStrip(payload.strip);
           else setCommodityStrip([]);
+          writeCache("commodity", {
+            items: Array.isArray(payload.items) ? payload.items : [],
+            strip: Array.isArray(payload.strip) ? payload.strip : [],
+          });
           setAssetItems([]);
         } else {
+          const cacheKey = `market-overview:${activeAsset}`;
+          const cached = readCache<{ items?: MarketItem[] }>(
+            cacheKey,
+            CACHE_TTL_MARKET,
+          );
+          if (cached?.items && Array.isArray(cached.items)) {
+            setAssetItems(cached.items);
+          }
           const res = await fetch(`/api/market-overview?asset=${activeAsset}`);
           if (!res.ok) throw new Error(`${res.status}`);
           const payload = (await res.json()) as { items?: MarketItem[] };
           if (Array.isArray(payload.items)) setAssetItems(payload.items);
           else setAssetItems([]);
+          writeCache(cacheKey, {
+            items: Array.isArray(payload.items) ? payload.items : [],
+          });
         }
       } catch (e) {
         console.error("Market overview error:", e);
@@ -2129,11 +2242,21 @@ export default function CryptoDashboard() {
     if (!isCommodity) return;
     setCommodityNewsLoading(true);
     try {
+      const cached = readCache<{ items?: CommodityNewsItem[] }>(
+        "commodity-news",
+        CACHE_TTL_NEWS,
+      );
+      if (cached?.items && Array.isArray(cached.items)) {
+        setCommodityNews(cached.items);
+      }
       const res = await fetch("/api/commodity-news");
       if (!res.ok) throw new Error(`${res.status}`);
       const payload = (await res.json()) as { items?: CommodityNewsItem[] };
       if (Array.isArray(payload.items)) setCommodityNews(payload.items);
       else setCommodityNews([]);
+      writeCache("commodity-news", {
+        items: Array.isArray(payload.items) ? payload.items : [],
+      });
     } catch (e) {
       console.error("Commodity news error:", e);
       setCommodityNews([]);
@@ -2574,7 +2697,20 @@ export default function CryptoDashboard() {
     .sort((a, b) => a.changePercent - b.changePercent)
     .slice(0, 6);
 
-  const movers = activeTab === "gainers" ? gainers : losers;
+  const commodityGainers = [...commodityOverviewItems]
+    .sort((a, b) => b.changePercent - a.changePercent)
+    .slice(0, 6);
+  const commodityLosers = [...commodityOverviewItems]
+    .sort((a, b) => a.changePercent - b.changePercent)
+    .slice(0, 6);
+
+  const movers = isCommodity
+    ? activeTab === "gainers"
+      ? commodityGainers
+      : commodityLosers
+    : activeTab === "gainers"
+      ? gainers
+      : losers;
   const fixedIncomeRising = [...fixedIncomeCards]
     .filter((item) => item.changeBps > 0)
     .sort((a, b) => b.changeBps - a.changeBps)
@@ -2632,23 +2768,15 @@ export default function CryptoDashboard() {
           </span>
 
           <div className="flex items-center gap-4">
-            <button
-              onClick={() => router.push("/orchestration")}
-              className="group relative overflow-hidden flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-linear-to-r from-emerald-400/30 via-cyan-400/20 to-violet-400/30 border border-emerald-300/40 text-sm font-semibold text-emerald-100 hover:text-white hover:border-emerald-300/75 transition-all whitespace-nowrap shadow-[0_0_22px_rgba(16,185,129,0.28)]"
-            >
-              <span className="absolute inset-0 bg-linear-to-r from-transparent via-white/20 to-transparent -translate-x-full group-hover:translate-x-full transition-transform duration-700" />
-              <Sparkles className="w-3.5 h-3.5 relative" />
-              <span className="relative">AGENT ORCHESTRATION</span>
-            </button>
-
-            {/* Trading Dashboard button */}
-            <button
-              onClick={() => setShowTradingModal(true)}
+            <a
+              href="/orchestration"
+              target="_blank"
+              rel="noopener noreferrer"
               className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-white/[0.06] border border-white/[0.12] text-sm font-semibold text-zinc-200 hover:bg-white/[0.10] hover:border-white/[0.22] hover:text-white transition-all whitespace-nowrap"
             >
-              <BarChart2 className="w-3.5 h-3.5" />
-              TRADING DASHBOARD
-            </button>
+              <Sparkles className="w-3.5 h-3.5" />
+              AGENT ORCHESTRATION
+            </a>
 
             {/* Sentiment widget */}
             {isCrypto && sentiment && (
