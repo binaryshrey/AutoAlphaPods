@@ -190,6 +190,38 @@ interface EquityPoint {
   equity: number;
 }
 
+interface DrawdownPoint {
+  date: string;
+  drawdown_pct: number;
+}
+
+interface ExposurePoint {
+  date: string;
+  gross: number;
+  net: number;
+}
+
+interface RollingSharpePoint {
+  date: string;
+  sharpe: number;
+}
+
+interface PositionPoint {
+  date: string;
+  price: number;
+  position: number;
+}
+
+interface TradeEventPoint extends PositionPoint {
+  delta: number;
+}
+
+interface TickerPositionSeries {
+  ticker: string;
+  points: PositionPoint[];
+  trade_events: TradeEventPoint[];
+}
+
 interface BacktestResult {
   prompt: string;
   tickers: string;
@@ -199,11 +231,22 @@ interface BacktestResult {
   calmar: number;
   max_dd: string;
   cagr: string;
+  volatility?: string;
   win_rate: string;
   max_streak: number;
   total_return: string;
   end_equity: string;
+  best_day?: string;
+  worst_day?: string;
+  rebalance_days?: number;
+  avg_daily_turnover?: string;
+  avg_gross_exposure?: string;
+  avg_net_exposure?: string;
   equity_curve: EquityPoint[];
+  drawdown_curve?: DrawdownPoint[];
+  exposure_curve?: ExposurePoint[];
+  rolling_sharpe_63d?: RollingSharpePoint[];
+  position_series?: TickerPositionSeries[];
 }
 
 interface ChatMessage {
@@ -463,6 +506,21 @@ function MetricPill({ label, value }: { label: string; value: string }) {
 }
 
 function BacktestCard({ data }: { data: BacktestResult }) {
+  const [primaryChart, setPrimaryChart] = useState<
+    "equity" | "drawdown" | "exposure"
+  >("equity");
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  const [showCode, setShowCode] = useState(false);
+
+  const tickerPositionSeries = data.position_series ?? [];
+  const [selectedTicker, setSelectedTicker] = useState(
+    tickerPositionSeries[0]?.ticker ?? "",
+  );
+  const activeTicker =
+    selectedTicker && tickerPositionSeries.some((t) => t.ticker === selectedTicker)
+      ? selectedTicker
+      : tickerPositionSeries[0]?.ticker ?? "";
+
   const equitySeries = [
     {
       name: "Equity",
@@ -472,95 +530,369 @@ function BacktestCard({ data }: { data: BacktestResult }) {
       ]),
     },
   ];
+  const drawdownSeries = [
+    {
+      name: "Drawdown %",
+      data: (data.drawdown_curve ?? []).map((point) => [
+        new Date(point.date).getTime(),
+        point.drawdown_pct,
+      ]),
+    },
+  ];
+  const exposureSeries = [
+    {
+      name: "Gross Exposure %",
+      data: (data.exposure_curve ?? []).map((point) => [
+        new Date(point.date).getTime(),
+        point.gross,
+      ]),
+    },
+    {
+      name: "Net Exposure %",
+      data: (data.exposure_curve ?? []).map((point) => [
+        new Date(point.date).getTime(),
+        point.net,
+      ]),
+    },
+  ];
+  const rollingSharpeSeries = [
+    {
+      name: "Rolling Sharpe (63D)",
+      data: (data.rolling_sharpe_63d ?? []).map((point) => [
+        new Date(point.date).getTime(),
+        point.sharpe,
+      ]),
+    },
+  ];
 
-  const options = {
+  const selectedTickerSeries =
+    tickerPositionSeries.find((item) => item.ticker === activeTicker) ??
+    tickerPositionSeries[0];
+  const tickerOverlaySeries = selectedTickerSeries
+    ? [
+        {
+          name: `${selectedTickerSeries.ticker} Price`,
+          type: "line",
+          data: selectedTickerSeries.points.map((point) => [
+            new Date(point.date).getTime(),
+            point.price,
+          ]),
+        },
+        {
+          name: "Position %",
+          type: "area",
+          data: selectedTickerSeries.points.map((point) => [
+            new Date(point.date).getTime(),
+            point.position * 100,
+          ]),
+        },
+      ]
+    : [];
+
+  const baseChartOptions = {
     chart: {
-      type: "area" as const,
       toolbar: { show: false },
       animations: { enabled: false },
       background: "transparent",
-      sparkline: { enabled: false },
     },
-    stroke: { curve: "smooth" as const, width: 2 },
-    fill: {
-      type: "gradient" as const,
-      gradient: {
-        shadeIntensity: 1,
-        opacityFrom: 0.3,
-        opacityTo: 0.02,
-        stops: [0, 100],
-      },
-    },
-    colors: ["#22c55e"],
     grid: {
-      borderColor: "rgba(255,255,255,0.06)",
+      borderColor: "rgba(255,255,255,0.08)",
       strokeDashArray: 3,
-      padding: { left: 10, right: 10, top: 0, bottom: 0 },
+      padding: { left: 8, right: 8, top: 4, bottom: 4 },
     },
     xaxis: {
       type: "datetime" as const,
-      labels: { style: { colors: "#71717a", fontSize: "10px" } },
+      labels: { style: { colors: "#6b7280", fontSize: "10px" } },
       axisBorder: { show: false },
       axisTicks: { show: false },
     },
-    yaxis: {
-      labels: {
-        style: { colors: "#71717a", fontSize: "10px" },
-        formatter: (val: number) => `$${val.toLocaleString("en-US")}`,
-      },
-    },
     tooltip: {
       theme: "dark" as const,
-      x: { format: "MMM yyyy" },
+      x: { format: "dd MMM yyyy" },
+    },
+  };
+
+  const primarySeries =
+    primaryChart === "equity"
+      ? equitySeries
+      : primaryChart === "drawdown"
+        ? drawdownSeries
+        : exposureSeries;
+
+  const primaryOptions = {
+    ...baseChartOptions,
+    stroke: {
+      curve: "smooth" as const,
+      width: primaryChart === "exposure" ? [2, 2] : 2,
+    },
+    fill:
+      primaryChart === "equity" || primaryChart === "drawdown"
+        ? {
+            type: "gradient" as const,
+            gradient: {
+              shadeIntensity: 1,
+              opacityFrom: 0.3,
+              opacityTo: 0.03,
+              stops: [0, 100],
+            },
+          }
+        : { opacity: 1 },
+    colors:
+      primaryChart === "equity"
+        ? ["#10b981"]
+        : primaryChart === "drawdown"
+          ? ["#f97316"]
+          : ["#38bdf8", "#a78bfa"],
+    yaxis: {
+      labels: {
+        style: { colors: "#6b7280", fontSize: "10px" },
+        formatter: (val: number) =>
+          primaryChart === "equity"
+            ? `$${val.toLocaleString("en-US", { maximumFractionDigits: 0 })}`
+            : `${val.toFixed(1)}%`,
+      },
+    },
+    legend: {
+      show: primaryChart === "exposure",
+      labels: { colors: "#a1a1aa" },
+    },
+  };
+
+  const tickerOverlayOptions = {
+    ...baseChartOptions,
+    colors: ["#f8fafc", "#22c55e"],
+    stroke: {
+      curve: "smooth" as const,
+      width: [2, 1.8],
+    },
+    fill: {
+      type: ["solid", "gradient"],
+      gradient: {
+        shadeIntensity: 1,
+        opacityFrom: 0.35,
+        opacityTo: 0.04,
+        stops: [0, 100],
+      },
+    },
+    yaxis: [
+      {
+        labels: {
+          style: { colors: "#6b7280", fontSize: "10px" },
+          formatter: (val: number) =>
+            `$${val.toLocaleString("en-US", { maximumFractionDigits: 2 })}`,
+        },
+        title: {
+          text: "Price",
+          style: { color: "#71717a", fontSize: "10px" },
+        },
+      },
+      {
+        opposite: true,
+        min: -100,
+        max: 100,
+        labels: {
+          style: { colors: "#6b7280", fontSize: "10px" },
+          formatter: (val: number) => `${val.toFixed(0)}%`,
+        },
+        title: {
+          text: "Position",
+          style: { color: "#71717a", fontSize: "10px" },
+        },
+      },
+    ],
+    legend: {
+      show: true,
+      labels: { colors: "#a1a1aa" },
+    },
+  };
+
+  const rollingSharpeOptions = {
+    ...baseChartOptions,
+    stroke: { curve: "smooth" as const, width: 2 },
+    colors: ["#facc15"],
+    yaxis: {
+      labels: {
+        style: { colors: "#6b7280", fontSize: "10px" },
+        formatter: (val: number) => val.toFixed(2),
+      },
     },
   };
 
   return (
-    <div className="rounded-2xl border border-white/10 bg-[#0a0a0a] p-5 space-y-5">
-      <div className="space-y-2">
-        <p className="text-xs uppercase tracking-wider text-zinc-500">
-          Backtest Prompt
-        </p>
-        <p className="text-sm text-zinc-100">{data.prompt}</p>
-        <div className="flex flex-wrap items-center gap-2">
-          <MetricPill label="Tickers" value={data.tickers} />
-          <MetricPill label="End Equity" value={data.end_equity} />
-          <MetricPill label="Total Return" value={data.total_return} />
+    <div className="rounded-2xl border border-white/10 bg-linear-to-br from-[#0a0b14] via-[#0a0a0a] to-[#10131f] p-5 space-y-4 shadow-[0_25px_80px_rgba(0,0,0,0.45)]">
+      <div className="rounded-xl border border-white/10 bg-black/35 p-4 space-y-3">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div className="space-y-1.5">
+            <p className="text-[10px] uppercase tracking-[0.2em] text-zinc-500">
+              Backtest Strategy
+            </p>
+            <p className="text-sm text-zinc-100 leading-relaxed">{data.prompt}</p>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <MetricPill label="Tickers" value={data.tickers} />
+            <MetricPill label="End Equity" value={data.end_equity} />
+            <MetricPill label="Total Return" value={data.total_return} />
+          </div>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          <MetricPill label="Sharpe" value={data.sharpe.toFixed(2)} />
+          <MetricPill label="Sortino" value={data.sortino.toFixed(2)} />
+          <MetricPill label="Calmar" value={data.calmar.toFixed(2)} />
+          <MetricPill label="Volatility" value={data.volatility || "—"} />
+          <MetricPill label="Max DD" value={data.max_dd} />
+          <MetricPill label="CAGR" value={data.cagr} />
+          <MetricPill label="Win Rate" value={data.win_rate} />
+          <MetricPill label="Best Day" value={data.best_day || "—"} />
+          <MetricPill label="Worst Day" value={data.worst_day || "—"} />
+          <MetricPill
+            label="Turnover"
+            value={data.avg_daily_turnover || "—"}
+          />
         </div>
       </div>
 
-      <div className="flex flex-wrap gap-2">
-        <MetricPill label="Sharpe" value={data.sharpe.toFixed(2)} />
-        <MetricPill label="Sortino" value={data.sortino.toFixed(2)} />
-        <MetricPill label="Calmar" value={data.calmar.toFixed(2)} />
-        <MetricPill label="Max DD" value={data.max_dd} />
-        <MetricPill label="CAGR" value={data.cagr} />
-        <MetricPill label="Win Rate" value={data.win_rate} />
-        <MetricPill label="Max Streak" value={String(data.max_streak)} />
-      </div>
-
-      <div className="rounded-xl border border-white/10 bg-black/40 p-4">
-        <p className="text-xs uppercase tracking-wider text-zinc-500 mb-2">
-          Generated Code
-        </p>
-        <pre className="text-xs text-zinc-200 overflow-x-auto">
-          <code>{data.generated_code}</code>
-        </pre>
-      </div>
-
-      <div className="rounded-xl border border-white/10 bg-black/40 p-4">
-        <div className="flex items-center justify-between mb-2">
-          <p className="text-xs uppercase tracking-wider text-zinc-500">
-            Equity Curve
-          </p>
-          <span className="text-xs text-zinc-500">Monthly</span>
+      <div className="rounded-xl border border-white/10 bg-black/35 p-4">
+        <div className="flex items-center justify-between gap-3 mb-3">
+          <div className="flex items-center gap-2">
+            {(["equity", "drawdown", "exposure"] as const).map((mode) => (
+              <button
+                key={mode}
+                type="button"
+                onClick={() => setPrimaryChart(mode)}
+                className={`px-2.5 py-1 rounded-md text-[11px] border transition-colors ${
+                  primaryChart === mode
+                    ? "bg-white text-black border-white"
+                    : "bg-white/[0.02] text-zinc-400 border-white/12 hover:text-zinc-200 hover:border-white/30"
+                }`}
+              >
+                {mode === "equity"
+                  ? "Equity"
+                  : mode === "drawdown"
+                    ? "Drawdown"
+                    : "Exposure"}
+              </button>
+            ))}
+          </div>
+          <span className="text-[10px] text-zinc-500">Daily</span>
         </div>
         <ReactApexChart
-          type="area"
-          series={equitySeries}
-          options={options}
-          height={220}
+          type={primaryChart === "equity" ? "area" : "line"}
+          series={primarySeries}
+          options={primaryOptions}
+          height={250}
         />
+      </div>
+
+      <div className="rounded-xl border border-white/10 bg-black/35 p-3">
+        <button
+          type="button"
+          onClick={() => setShowAdvanced((prev) => !prev)}
+          className="w-full flex items-center justify-between text-xs text-zinc-300 hover:text-white transition-colors"
+        >
+          <span>Advanced analytics (positions, rolling Sharpe, model code)</span>
+          {showAdvanced ? (
+            <ChevronUp className="w-3.5 h-3.5" />
+          ) : (
+            <ChevronDown className="w-3.5 h-3.5" />
+          )}
+        </button>
+
+        {showAdvanced && (
+          <div className="mt-3 space-y-4">
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+              <div className="rounded-lg border border-white/8 bg-white/[0.02] px-2.5 py-2">
+                <p className="text-[10px] text-zinc-500">Rebalance Days</p>
+                <p className="text-[12px] font-semibold text-zinc-100">
+                  {data.rebalance_days ?? "—"}
+                </p>
+              </div>
+              <div className="rounded-lg border border-white/8 bg-white/[0.02] px-2.5 py-2">
+                <p className="text-[10px] text-zinc-500">Avg Gross Exposure</p>
+                <p className="text-[12px] font-semibold text-zinc-100">
+                  {data.avg_gross_exposure || "—"}
+                </p>
+              </div>
+              <div className="rounded-lg border border-white/8 bg-white/[0.02] px-2.5 py-2">
+                <p className="text-[10px] text-zinc-500">Avg Net Exposure</p>
+                <p className="text-[12px] font-semibold text-zinc-100">
+                  {data.avg_net_exposure || "—"}
+                </p>
+              </div>
+              <div className="rounded-lg border border-white/8 bg-white/[0.02] px-2.5 py-2">
+                <p className="text-[10px] text-zinc-500">Max Losing Streak</p>
+                <p className="text-[12px] font-semibold text-zinc-100">
+                  {data.max_streak}
+                </p>
+              </div>
+            </div>
+
+            {tickerPositionSeries.length > 0 && (
+              <div className="rounded-xl border border-white/10 bg-black/30 p-3">
+                <div className="flex items-center justify-between gap-3 mb-3">
+                  <p className="text-[11px] uppercase tracking-wider text-zinc-500">
+                    Positions On Price
+                  </p>
+                  <div className="flex flex-wrap gap-1.5">
+                    {tickerPositionSeries.map((series) => (
+                      <button
+                        key={series.ticker}
+                        type="button"
+                        onClick={() => setSelectedTicker(series.ticker)}
+                        className={`px-2 py-0.5 rounded-md text-[10px] border transition-colors ${
+                          activeTicker === series.ticker
+                            ? "bg-emerald-400/20 border-emerald-400/50 text-emerald-300"
+                            : "bg-white/[0.02] border-white/10 text-zinc-400 hover:text-zinc-200 hover:border-white/25"
+                        }`}
+                      >
+                        {series.ticker}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <ReactApexChart
+                  type="line"
+                  series={tickerOverlaySeries}
+                  options={tickerOverlayOptions}
+                  height={300}
+                />
+              </div>
+            )}
+
+            {(data.rolling_sharpe_63d ?? []).length > 0 && (
+              <div className="rounded-xl border border-white/10 bg-black/30 p-3">
+                <p className="text-[11px] uppercase tracking-wider text-zinc-500 mb-2">
+                  Rolling Sharpe (63 Trading Days)
+                </p>
+                <ReactApexChart
+                  type="line"
+                  series={rollingSharpeSeries}
+                  options={rollingSharpeOptions}
+                  height={200}
+                />
+              </div>
+            )}
+
+            <div className="rounded-xl border border-white/10 bg-black/30 p-3">
+              <button
+                type="button"
+                onClick={() => setShowCode((prev) => !prev)}
+                className="w-full flex items-center justify-between text-[11px] text-zinc-400 hover:text-zinc-200 transition-colors"
+              >
+                <span>Generated strategy code</span>
+                {showCode ? (
+                  <ChevronUp className="w-3.5 h-3.5" />
+                ) : (
+                  <ChevronDown className="w-3.5 h-3.5" />
+                )}
+              </button>
+              {showCode && (
+                <pre className="mt-2 text-xs text-zinc-200 overflow-x-auto rounded-lg border border-white/10 bg-black/50 p-3">
+                  <code>{data.generated_code}</code>
+                </pre>
+              )}
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

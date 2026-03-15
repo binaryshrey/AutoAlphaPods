@@ -149,7 +149,7 @@ Available DataFrames:
 
 Write ONLY a function called `generate_signals(macro, prices)` that returns:
 - pd.DataFrame with DatetimeIndex
-- Columns = ETF tickers (e.g. "TLT", "GLD")
+- Columns = tickers (e.g. "TLT", "GLD")
 - Values = float weights (1.0=long, -1.0=short, 0=flat)
 
 Hard rules:
@@ -158,7 +158,6 @@ Hard rules:
 3. Use .shift(1) on ALL signals to prevent look-ahead bias
 4. Handle NaN with .fillna(0)
 5. Return a DataFrame, never a Series
-6. Resample to monthly (.resample('ME').last()) then reindex to daily prices index
 """
 
 SPHINX_OUTPUT_CODE_BLOCK = re.compile(r"```(?:python)?\s*(.*?)```", re.DOTALL)
@@ -253,11 +252,22 @@ class MetricsResult(BaseModel):
     calmar: float
     max_dd: str
     cagr: str
+    volatility: str
     win_rate: str
     max_streak: int
     total_return: str
     end_equity: str
+    best_day: str
+    worst_day: str
+    rebalance_days: int
+    avg_daily_turnover: str
+    avg_gross_exposure: str
+    avg_net_exposure: str
     equity_curve: list[dict]   # [{date, equity}]
+    drawdown_curve: list[dict] # [{date, drawdown_pct}]
+    exposure_curve: list[dict] # [{date, gross, net}]
+    rolling_sharpe_63d: list[dict] # [{date, sharpe}]
+    position_series: list[dict] # [{ticker, points:[{date, price, position}], trade_events:[...]}]
 
 class BatchResult(BaseModel):
     job_id: str
@@ -646,7 +656,7 @@ def _simulate_portfolio(
     signals: pd.DataFrame,
     prices: pd.DataFrame,
     initial_cash: float,
-) -> tuple[pd.Series, pd.Series]:
+) -> tuple[pd.Series, pd.Series, pd.DataFrame, pd.DataFrame]:
     tickers = [t for t in signals.columns if t in prices.columns]
     if not tickers:
         raise RuntimeError(
@@ -658,30 +668,37 @@ def _simulate_portfolio(
     weights = signals[tickers].reindex(returns.index, method="ffill").fillna(0)
     row_sum = weights.abs().sum(axis=1).replace(0, 1)
     weights = weights.div(row_sum, axis=0).shift(1).fillna(0)
-    port_returns = (weights * returns).sum(axis=1).dropna()
+    port_returns = (weights * returns).sum(axis=1).replace([np.inf, -np.inf], np.nan).fillna(0)
     equity       = (1 + port_returns).cumprod() * initial_cash
-    return port_returns, equity
+    return port_returns, equity, weights, px
 
 
 def _compute_metrics(
     port_returns: pd.Series,
     equity: pd.Series,
+    weights: pd.DataFrame,
+    prices: pd.DataFrame,
     prompt: str,
     tickers: list,
     code: str,
 ) -> dict:
+    if port_returns.empty or equity.empty:
+        raise RuntimeError("Backtest produced an empty return series.")
+
     ann    = 252
     mean_r = port_returns.mean()
     std_r  = port_returns.std()
     sharpe = (mean_r / std_r * np.sqrt(ann)) if std_r > 0 else 0.0
 
-    rolling_max = equity.cummax()
-    max_dd      = ((equity - rolling_max) / rolling_max).min()
+    rolling_max = equity.cummax().replace(0, np.nan)
+    drawdown_series = ((equity - rolling_max) / rolling_max).fillna(0)
+    max_dd      = drawdown_series.min()
 
     n_years = len(port_returns) / ann
     total_r = equity.iloc[-1] / equity.iloc[0] - 1
     cagr    = (1 + total_r) ** (1 / n_years) - 1 if n_years > 0 else 0.0
     calmar  = (cagr / abs(max_dd)) if max_dd != 0 else 0.0
+    ann_vol = std_r * np.sqrt(ann) if std_r > 0 else 0.0
 
     downside = port_returns[port_returns < 0]
     sortino  = (mean_r / downside.std() * np.sqrt(ann)) if len(downside) > 1 else 0.0
@@ -697,12 +714,73 @@ def _compute_metrics(
         else:
             losing_streak = 0
 
-    # Equity curve — downsample to monthly for response size
-    equity_monthly = equity.resample("ME").last()
+    aligned_weights = weights.reindex(port_returns.index).fillna(0)
+    aligned_prices = prices.reindex(port_returns.index).ffill()
+
+    daily_turnover = aligned_weights.diff().abs().sum(axis=1).fillna(0)
+    rebalance_days = int((daily_turnover > 1e-6).sum())
+    gross_exposure = aligned_weights.abs().sum(axis=1)
+    net_exposure = aligned_weights.sum(axis=1)
+
+    rolling_sharpe_63d = (
+        port_returns.rolling(63).mean()
+        .div(port_returns.rolling(63).std().replace(0, np.nan))
+        .mul(np.sqrt(ann))
+        .replace([np.inf, -np.inf], np.nan)
+        .dropna()
+    )
+
     equity_curve = [
         {"date": str(d.date()), "equity": round(float(v), 2)}
-        for d, v in equity_monthly.items()
+        for d, v in equity.items()
     ]
+    drawdown_curve = [
+        {"date": str(d.date()), "drawdown_pct": round(float(v) * 100, 2)}
+        for d, v in drawdown_series.items()
+    ]
+    exposure_curve = [
+        {
+            "date": str(d.date()),
+            "gross": round(float(gross_exposure.loc[d]) * 100, 2),
+            "net": round(float(net_exposure.loc[d]) * 100, 2),
+        }
+        for d in aligned_weights.index
+    ]
+    rolling_sharpe_curve = [
+        {"date": str(d.date()), "sharpe": round(float(v), 3)}
+        for d, v in rolling_sharpe_63d.items()
+    ]
+
+    position_series: list[dict] = []
+    for ticker in aligned_prices.columns.tolist():
+        price_series = aligned_prices[ticker].astype(float)
+        position_series_ticker = aligned_weights[ticker].astype(float)
+        valid_idx = price_series.index[price_series.notna()]
+
+        points = [
+            {
+                "date": str(d.date()),
+                "price": round(float(price_series.loc[d]), 4),
+                "position": round(float(position_series_ticker.loc[d]), 4),
+            }
+            for d in valid_idx
+        ]
+
+        deltas = position_series_ticker.diff().fillna(position_series_ticker)
+        trade_idx = deltas.index[(deltas.abs() > 1e-6) & price_series.notna()]
+        trade_events = [
+            {
+                "date": str(d.date()),
+                "price": round(float(price_series.loc[d]), 4),
+                "position": round(float(position_series_ticker.loc[d]), 4),
+                "delta": round(float(deltas.loc[d]), 4),
+            }
+            for d in trade_idx[:600]
+        ]
+
+        position_series.append(
+            {"ticker": ticker, "points": points, "trade_events": trade_events}
+        )
 
     return {
         "prompt"        : prompt,
@@ -713,11 +791,22 @@ def _compute_metrics(
         "calmar"        : round(calmar, 2),
         "max_dd"        : f"{max_dd*100:.1f}%",
         "cagr"          : f"{cagr*100:.1f}%",
+        "volatility"    : f"{ann_vol*100:.1f}%",
         "win_rate"      : f"{win_rate*100:.0f}%",
         "max_streak"    : max_streak,
         "total_return"  : f"{total_r*100:.1f}%",
         "end_equity"    : f"${equity.iloc[-1]:,.0f}",
+        "best_day"      : f"{port_returns.max()*100:.2f}%",
+        "worst_day"     : f"{port_returns.min()*100:.2f}%",
+        "rebalance_days": rebalance_days,
+        "avg_daily_turnover": f"{daily_turnover.mean()*100:.1f}%",
+        "avg_gross_exposure": f"{gross_exposure.mean()*100:.1f}%",
+        "avg_net_exposure": f"{net_exposure.mean()*100:.1f}%",
         "equity_curve"  : equity_curve,
+        "drawdown_curve": drawdown_curve,
+        "exposure_curve": exposure_curve,
+        "rolling_sharpe_63d": rolling_sharpe_curve,
+        "position_series": position_series,
     }
 
 
@@ -757,10 +846,12 @@ def _run_single_backtest(
     signals = _execute_strategy(code, macro, prices)
 
     _stream_log(stream_log, "Simulating portfolio.", stage="simulate_portfolio")
-    port_returns, equity = _simulate_portfolio(signals, prices, initial_cash)
+    port_returns, equity, weights, aligned_prices = _simulate_portfolio(
+        signals, prices, initial_cash
+    )
     _stream_log(stream_log, "Computing metrics.", stage="compute_metrics")
     metrics = _compute_metrics(
-        port_returns, equity, prompt,
+        port_returns, equity, weights, aligned_prices, prompt,
         tickers=signals.columns.tolist(),
         code=code,
     )
@@ -815,6 +906,8 @@ def _run_single_backtest_sphinx(
     metrics = _compute_metrics(
         port_returns,
         equity,
+        weights,
+        aligned_prices,
         prompt,
         tickers=signals.columns.tolist(),
         code=code,
