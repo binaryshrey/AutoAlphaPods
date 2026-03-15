@@ -56,15 +56,53 @@ def _sphinx_api_key() -> str | None:
     return os.getenv("SPHINX_API_KEY")
 
 
+def _orchestration_self_port() -> int:
+    raw = os.getenv("PORT", "8000").strip()
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid PORT value for orchestration backtest routing: %r. Falling back to 8000.",
+            raw,
+        )
+        return 8000
+
+
+def _default_orchestration_backtest_url() -> str:
+    url = f"http://127.0.0.1:{_orchestration_self_port()}/backtest/sphinx"
+    logger.info(
+        "Resolved default orchestration backtest URL from PORT=%s: %s",
+        os.getenv("PORT"),
+        url,
+    )
+    return url
+
+
 def _orchestration_backtest_url() -> str:
-    return os.getenv("ORCHESTRATION_BACKTEST_URL", "http://127.0.0.1:8000/backtest/sphinx")
+    explicit_url = os.getenv("ORCHESTRATION_BACKTEST_URL")
+    if explicit_url:
+        logger.info(
+            "Resolved orchestration backtest URL from ORCHESTRATION_BACKTEST_URL: %s",
+            explicit_url,
+        )
+        return explicit_url
+    return _default_orchestration_backtest_url()
 
 
 def _orchestration_backtest_stream_url() -> str:
-    return os.getenv(
-        "ORCHESTRATION_BACKTEST_STREAM_URL",
-        _orchestration_backtest_url().rstrip("/") + "/stream",
+    explicit_url = os.getenv("ORCHESTRATION_BACKTEST_STREAM_URL")
+    if explicit_url:
+        logger.info(
+            "Resolved orchestration backtest stream URL from ORCHESTRATION_BACKTEST_STREAM_URL: %s",
+            explicit_url,
+        )
+        return explicit_url
+    url = _orchestration_backtest_url().rstrip("/") + "/stream"
+    logger.info(
+        "Resolved orchestration backtest stream URL from base URL: %s",
+        url,
     )
+    return url
 
 RUN_STORE: dict[str, dict[str, Any]] = {}
 RUN_STORE_LOCK = Lock()
@@ -482,6 +520,7 @@ def _extract_backtest_prompt(memo_markdown: str) -> str:
 
 
 def _call_backtest_api(prompt: str, start: str, end: str, initial_cash: float) -> dict[str, Any]:
+    target_url = _orchestration_backtest_url()
     payload = {
         "prompt": prompt,
         "start": start,
@@ -490,10 +529,17 @@ def _call_backtest_api(prompt: str, start: str, end: str, initial_cash: float) -
     }
     data = json.dumps(payload).encode("utf-8")
     req = urllib_request.Request(
-        _orchestration_backtest_url(),
+        target_url,
         data=data,
         headers={"Content-Type": "application/json"},
         method="POST",
+    )
+    logger.info(
+        "Calling orchestration backtest endpoint url=%s stream=%s port=%s explicit_url=%s",
+        target_url,
+        False,
+        os.getenv("PORT"),
+        bool(os.getenv("ORCHESTRATION_BACKTEST_URL")),
     )
     try:
         with urllib_request.urlopen(req, timeout=600) as resp:
@@ -501,8 +547,21 @@ def _call_backtest_api(prompt: str, start: str, end: str, initial_cash: float) -
             return json.loads(raw)
     except HTTPError as err:
         body = err.read().decode("utf-8", errors="ignore")
+        logger.exception(
+            "Backtest API HTTP error url=%s status=%s body=%s",
+            target_url,
+            err.code,
+            body[:500],
+        )
         raise RuntimeError(f"Backtest API HTTP {err.code}: {body}") from err
     except URLError as err:
+        logger.exception(
+            "Backtest API connection error url=%s reason=%s port=%s explicit_url=%s",
+            target_url,
+            err.reason,
+            os.getenv("PORT"),
+            bool(os.getenv("ORCHESTRATION_BACKTEST_URL")),
+        )
         raise RuntimeError(f"Backtest API connection error: {err}") from err
 
 
@@ -515,6 +574,7 @@ def _call_backtest_api_streaming(
     end: str,
     initial_cash: float,
 ) -> dict[str, Any]:
+    target_url = _orchestration_backtest_stream_url()
     payload = {
         "prompt": prompt,
         "start": start,
@@ -523,7 +583,7 @@ def _call_backtest_api_streaming(
     }
     data = json.dumps(payload).encode("utf-8")
     req = urllib_request.Request(
-        _orchestration_backtest_stream_url(),
+        target_url,
         data=data,
         headers={
             "Content-Type": "application/json",
@@ -531,6 +591,14 @@ def _call_backtest_api_streaming(
             "Cache-Control": "no-cache",
         },
         method="POST",
+    )
+    logger.info(
+        "Calling orchestration backtest endpoint url=%s stream=%s port=%s explicit_stream_url=%s explicit_url=%s",
+        target_url,
+        True,
+        os.getenv("PORT"),
+        bool(os.getenv("ORCHESTRATION_BACKTEST_STREAM_URL")),
+        bool(os.getenv("ORCHESTRATION_BACKTEST_URL")),
     )
 
     last_event = "message"
@@ -594,10 +662,11 @@ def _call_backtest_api_streaming(
     except Exception:
         # Fallback to non-stream endpoint to preserve functionality if stream parsing fails.
         logger.exception(
-            "Backtest stream failed for run_id=%s analyst_id=%s analyst_name=%s; falling back to non-stream endpoint.",
+            "Backtest stream failed for run_id=%s analyst_id=%s analyst_name=%s url=%s; falling back to non-stream endpoint.",
             run_id,
             analyst.id,
             analyst.name,
+            target_url,
         )
         _append_event(
             run_id,
