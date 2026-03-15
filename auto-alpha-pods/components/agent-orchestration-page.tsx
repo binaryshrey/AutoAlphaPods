@@ -111,6 +111,10 @@ function stageTone(stage: string): string {
   if (stage === "result") return "text-emerald-300";
   if (stage === "backtest") return "text-sky-300";
   if (stage === "review") return "text-amber-300";
+  if (stage === "news") return "text-cyan-300";
+  if (stage === "critique") return "text-orange-300";
+  if (stage === "revision") return "text-indigo-300";
+  if (stage === "sphinx_cli") return "text-fuchsia-300";
   if (stage === "ideation" || stage === "proposal") return "text-violet-300";
   return "text-zinc-300";
 }
@@ -210,13 +214,13 @@ export default function AgentOrchestrationPage() {
         if (cancelled) return;
         setRunData(payload);
         if (payload.status === "completed" || payload.status === "failed") return;
-        setTimeout(poll, 2200);
+        setTimeout(poll, 1200);
       } catch (err) {
         if (!cancelled) {
           setRunError(
             err instanceof Error ? err.message : "Failed to poll orchestration run.",
           );
-          setTimeout(poll, 4000);
+          setTimeout(poll, 2000);
         }
       }
     };
@@ -555,7 +559,12 @@ export default function AgentOrchestrationPage() {
                 </p>
               ) : (
                 (runData?.events || []).map((event) => (
-                  <div key={event.id} className="leading-relaxed">
+                  <div
+                    key={event.id}
+                    className={`leading-relaxed ${
+                      event.stage === "sphinx_cli" ? "opacity-85 text-[10px]" : ""
+                    }`}
+                  >
                     <span className="text-zinc-600">
                       [{new Date(event.ts).toLocaleTimeString("en-US")}]
                     </span>{" "}

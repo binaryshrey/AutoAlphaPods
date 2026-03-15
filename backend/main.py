@@ -579,6 +579,21 @@ def _build_sphinx_env() -> dict:
 
 
 def _ensure_sphinx_ready(stream_log: StreamLogFn = None) -> None:
+    # API-key auth is sufficient for non-interactive usage; avoid forcing local login
+    # checks that can fail on machines without a pre-warmed nodeenv.
+    force_status_check = os.getenv("SPHINX_FORCE_STATUS_CHECK", "").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+    if SPHINX_API_KEY and not force_status_check:
+        _stream_log(
+            stream_log,
+            "SPHINX_API_KEY detected; skipping sphinx-cli status/login preflight.",
+            stage="sphinx_setup",
+        )
+        return
+
     _stream_log(stream_log, "Checking Sphinx CLI auth status.", stage="sphinx_setup")
     cmd = [_resolve_sphinx_cli(), "status"]
     result = subprocess.run(
@@ -900,7 +915,28 @@ def _run_single_backtest_sphinx(
 ) -> dict:
     """Full pipeline for one prompt using Sphinx CLI. Runs sync — call via executor."""
     _stream_log(stream_log, "Backtest started.", stage="start")
-    code = _ask_sphinx_sync(prompt, stream_log)
+    sphinx_fallback = os.getenv("SPHINX_FALLBACK_TO_OPENROUTER", "true").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+    try:
+        code = _ask_sphinx_sync(prompt, stream_log)
+    except Exception as sphinx_err:
+        if not sphinx_fallback:
+            raise
+        _stream_log(
+            stream_log,
+            f"Sphinx CLI failed; falling back to OpenRouter generation. Error: {sphinx_err}",
+            stage="generate_strategy",
+            level="warning",
+        )
+        logger.warning(
+            "Sphinx strategy generation failed, falling back to OpenRouter model. Error: %s",
+            sphinx_err,
+        )
+        code = _ask_llm_sync(prompt, MODEL, stream_log=stream_log)
+
     macro_columns = _infer_macro_columns(code)
     _stream_log(
         stream_log,

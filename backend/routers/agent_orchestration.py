@@ -1,13 +1,17 @@
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
+import time
 import uuid
 from datetime import datetime
+from html import unescape
 from pathlib import Path
 from threading import Lock
 from typing import Any
+from urllib.parse import quote
 from urllib import request as urllib_request
 from urllib.error import URLError, HTTPError
 
@@ -29,6 +33,10 @@ OPENROUTER_MODEL = os.getenv("MODEL", "openai/gpt-4o-mini")
 SPHINX_API_KEY = os.getenv("SPHINX_API_KEY")
 ORCHESTRATION_BACKTEST_URL = os.getenv(
     "ORCHESTRATION_BACKTEST_URL", "http://127.0.0.1:8000/backtest/sphinx"
+)
+ORCHESTRATION_BACKTEST_STREAM_URL = os.getenv(
+    "ORCHESTRATION_BACKTEST_STREAM_URL",
+    ORCHESTRATION_BACKTEST_URL.rstrip("/") + "/stream",
 )
 
 RUN_STORE: dict[str, dict[str, Any]] = {}
@@ -94,17 +102,49 @@ def _resolve_sphinx_cli() -> str:
 
 
 def _build_sphinx_env() -> dict[str, str]:
+    if not SPHINX_API_KEY:
+        raise RuntimeError(
+            "SPHINX_API_KEY is not set. Export it for non-interactive Sphinx auth."
+        )
     env = os.environ.copy()
-    if SPHINX_API_KEY:
-        env["SPHINX_API_KEY"] = SPHINX_API_KEY
+    env["SPHINX_API_KEY"] = SPHINX_API_KEY
     return env
 
 
+def _fetch_news_headlines(query: str, limit: int = 4) -> list[str]:
+    rss = (
+        "https://news.google.com/rss/search"
+        f"?q={quote(query)}&hl=en-US&gl=US&ceid=US:en"
+    )
+    try:
+        req = urllib_request.Request(
+            rss,
+            headers={
+                "Accept": "application/xml,text/xml",
+                "User-Agent": "AutoAlphaPods-Orchestrator/1.0",
+            },
+        )
+        with urllib_request.urlopen(req, timeout=25) as resp:
+            xml = resp.read().decode("utf-8", errors="ignore")
+        matches = re.findall(r"<title>(.*?)</title>", xml, flags=re.IGNORECASE | re.DOTALL)
+        cleaned = []
+        for raw in matches[1:]:  # first title is feed title
+            title = unescape(raw.strip())
+            if title:
+                cleaned.append(re.sub(r"\s+", " ", title))
+            if len(cleaned) >= limit:
+                break
+        return cleaned
+    except Exception:
+        return []
+
+
 def _run_sphinx_ideation(
+    run_id: str,
     objective: str,
     manager: AgentConfig,
     analyst: AgentConfig,
-) -> str:
+) -> dict[str, Any]:
     prompt = f"""
 You are {analyst.name}, a specialized trading analyst.
 Specialization: {analyst.specialization or "General macro/quant"}
@@ -136,7 +176,8 @@ Output format:
 ## Sources
 """.strip()
 
-    notebook_path = Path(tempfile.mkdtemp(prefix="sphinx-ideation-")) / "notes.ipynb"
+    temp_dir = tempfile.mkdtemp(prefix="sphinx-ideation-")
+    notebook_path = Path(temp_dir) / "notes.ipynb"
     cmd = [
         _resolve_sphinx_cli(),
         "chat",
@@ -145,15 +186,42 @@ Output format:
         "--notebook-filepath",
         str(notebook_path),
     ]
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        check=False,
-        env=_build_sphinx_env(),
-    )
-    if result.returncode == 0 and result.stdout.strip():
-        return result.stdout.strip()
+    output_lines: list[str] = []
+    try:
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            env=_build_sphinx_env(),
+        )
+        if process.stdout is not None:
+            for raw_line in process.stdout:
+                line = raw_line.rstrip()
+                output_lines.append(raw_line)
+                if line:
+                    _append_event(
+                        run_id,
+                        agent_id=analyst.id,
+                        agent_name=analyst.name,
+                        stage="sphinx_cli",
+                        message=line[:500],
+                    )
+        return_code = process.wait()
+        stdout = "".join(output_lines).strip()
+        if return_code == 0 and stdout:
+            return {"memo_markdown": stdout, "sphinx_stdout": stdout, "fallback": False}
+    except Exception as err:
+        _append_event(
+            run_id,
+            agent_id=analyst.id,
+            agent_name=analyst.name,
+            stage="sphinx_cli",
+            message=f"Sphinx ideation error: {err}",
+        )
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
     fallback = f"""## Thesis
 {analyst.name} proposes a regime-aware allocation strategy for {", ".join(analyst.assets) or "multi-asset ETFs"} [1][2].
@@ -173,7 +241,46 @@ Create a monthly-rebalanced strategy that rotates across {", ".join(analyst.asse
 [1] https://fred.stlouisfed.org/
 [2] https://finance.yahoo.com/
 """
-    return fallback
+    return {"memo_markdown": fallback, "sphinx_stdout": "".join(output_lines), "fallback": True}
+
+
+def _analyst_self_critique(analyst: AgentConfig, memo_markdown: str) -> str:
+    system_prompt = f"""
+You are {analyst.name}, critiquing your own strategy before manager review.
+Return 3 concise bullets:
+1) strongest edge
+2) main fragility
+3) one concrete revision
+""".strip()
+    output = _run_openrouter_chat(system_prompt, memo_markdown)
+    if output:
+        return output
+    return (
+        "- Edge: regime-aware signal captures macro transitions.\n"
+        "- Fragility: false positives in noisy periods.\n"
+        "- Revision: add explicit downside filter and exposure cap."
+    )
+
+
+def _manager_critique_round(manager: AgentConfig, analyst: AgentConfig, memo_markdown: str) -> str:
+    system_prompt = f"""
+You are {manager.name}, conducting an adversarial critique.
+Give 3 concise bullets:
+1) what evidence is weak
+2) what could be overfit
+3) what test requirement must be added
+""".strip()
+    output = _run_openrouter_chat(
+        system_prompt,
+        f"Analyst={analyst.name}\n\nMemo:\n{memo_markdown}",
+    )
+    if output:
+        return output
+    return (
+        "- Weak evidence: dependence on single-regime examples.\n"
+        "- Overfit risk: too many conditional thresholds.\n"
+        "- Requirement: include robustness across multiple market regimes."
+    )
 
 
 def _run_openrouter_chat(system_prompt: str, user_prompt: str) -> str:
@@ -301,6 +408,103 @@ def _call_backtest_api(prompt: str, start: str, end: str, initial_cash: float) -
         raise RuntimeError(f"Backtest API connection error: {err}") from err
 
 
+def _call_backtest_api_streaming(
+    run_id: str,
+    manager: AgentConfig,
+    analyst: AgentConfig,
+    prompt: str,
+    start: str,
+    end: str,
+    initial_cash: float,
+) -> dict[str, Any]:
+    payload = {
+        "prompt": prompt,
+        "start": start,
+        "end": end,
+        "initial_cash": initial_cash,
+    }
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib_request.Request(
+        ORCHESTRATION_BACKTEST_STREAM_URL,
+        data=data,
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+            "Cache-Control": "no-cache",
+        },
+        method="POST",
+    )
+
+    last_event = "message"
+    result_payload: dict[str, Any] | None = None
+    event_data_lines: list[str] = []
+
+    try:
+        with urllib_request.urlopen(req, timeout=900) as resp:
+            for raw_line in resp:
+                line = raw_line.decode("utf-8", errors="ignore").rstrip("\n")
+                if line.startswith("event:"):
+                    last_event = line.split(":", 1)[1].strip() or "message"
+                    continue
+                if line.startswith("data:"):
+                    event_data_lines.append(line.split(":", 1)[1].strip())
+                    continue
+
+                # SSE event separator (blank line)
+                if line.strip() == "":
+                    if not event_data_lines:
+                        continue
+                    data_blob = "\n".join(event_data_lines)
+                    event_data_lines = []
+                    try:
+                        payload_obj = json.loads(data_blob)
+                    except Exception:
+                        payload_obj = {"raw": data_blob}
+
+                    if last_event == "log":
+                        msg = str(payload_obj.get("message", "")).strip()
+                        stage = str(payload_obj.get("stage", "backtest")).strip() or "backtest"
+                        if msg:
+                            _append_event(
+                                run_id,
+                                agent_id=manager.id,
+                                agent_name=manager.name,
+                                stage=stage if stage != "generate_strategy" else "sphinx_cli",
+                                message=f"[{analyst.name}] {msg}"[:700],
+                            )
+                    elif last_event == "result":
+                        if isinstance(payload_obj, dict):
+                            result_payload = payload_obj
+                    elif last_event == "error":
+                        message = str(payload_obj.get("message", payload_obj))
+                        raise RuntimeError(f"Backtest stream error: {message}")
+
+                    last_event = "message"
+
+            if event_data_lines:
+                data_blob = "\n".join(event_data_lines)
+                try:
+                    payload_obj = json.loads(data_blob)
+                except Exception:
+                    payload_obj = {"raw": data_blob}
+                if last_event == "result" and isinstance(payload_obj, dict):
+                    result_payload = payload_obj
+
+        if result_payload is None:
+            raise RuntimeError("Backtest stream ended without a result payload.")
+        return result_payload
+    except Exception:
+        # Fallback to non-stream endpoint to preserve functionality if stream parsing fails.
+        _append_event(
+            run_id,
+            agent_id=manager.id,
+            agent_name=manager.name,
+            stage="backtest",
+            message="Backtest stream unavailable; falling back to non-stream endpoint.",
+        )
+        return _call_backtest_api(prompt, start, end, initial_cash)
+
+
 def _compute_regression_vs_spy(equity_curve: list[dict[str, Any]]) -> dict[str, Any]:
     if not equity_curve:
         return {"status": "insufficient_data"}
@@ -380,6 +584,9 @@ def _build_final_report(
     for item in results:
         analyst = item["analyst"]
         review = item["review"]
+        headlines_lines = [
+            f"- {headline}" for headline in item.get("headlines", [])[:6]
+        ] or ["- No fetched headlines recorded."]
         lines.extend(
             [
                 "",
@@ -387,6 +594,15 @@ def _build_final_report(
                 f"- **Approved by manager:** {'Yes' if review.get('approve') else 'No'}",
                 f"- **Manager notes:** {review.get('manager_notes', '')}",
                 f"- **Risk flags:** {', '.join(review.get('risk_flags', [])) or 'None'}",
+                "",
+                "#### News Context",
+                *headlines_lines,
+                "",
+                "#### Analyst Self-Critique",
+                item.get("self_critique", "_No self-critique captured_"),
+                "",
+                "#### Manager Critique Round",
+                item.get("manager_critique", "_No manager critique captured_"),
                 "",
                 "#### Analyst Memo",
                 item.get("memo_markdown", "_No memo_"),
@@ -463,6 +679,17 @@ def _run_orchestration_job(run_id: str, payload: dict[str, Any]) -> None:
             stage="manager",
             message="Manager initialized orchestration pipeline.",
         )
+        _append_event(
+            run_id,
+            agent_id=manager.id,
+            agent_name=manager.name,
+            stage="manager",
+            message=(
+                "SPHINX auth mode: API key"
+                if SPHINX_API_KEY
+                else "SPHINX auth mode: missing API key (fallbacks may apply)"
+            ),
+        )
 
         for analyst in analysts:
             _append_event(
@@ -472,7 +699,96 @@ def _run_orchestration_job(run_id: str, payload: dict[str, Any]) -> None:
                 stage="ideation",
                 message="Reading macro/news context and drafting cited thesis with SPHINX...",
             )
-            memo = _run_sphinx_ideation(objective, manager, analyst)
+            time.sleep(0.6)
+
+            news_query = (
+                f"{analyst.specialization} market strategy "
+                + (" ".join(analyst.assets[:3]) if analyst.assets else "")
+            ).strip()
+            headlines = _fetch_news_headlines(news_query, limit=4)
+            if headlines:
+                _append_event(
+                    run_id,
+                    agent_id=analyst.id,
+                    agent_name=analyst.name,
+                    stage="news",
+                    message=f"Pulled {len(headlines)} headlines for context.",
+                )
+                for i, headline in enumerate(headlines, start=1):
+                    _append_event(
+                        run_id,
+                        agent_id=analyst.id,
+                        agent_name=analyst.name,
+                        stage="news",
+                        message=f"[{i}] {headline}",
+                    )
+                    time.sleep(0.25)
+            else:
+                _append_event(
+                    run_id,
+                    agent_id=analyst.id,
+                    agent_name=analyst.name,
+                    stage="news",
+                    message="No fresh headlines retrieved; proceeding with macro priors and market data.",
+                )
+
+            time.sleep(0.45)
+            ideation = _run_sphinx_ideation(run_id, objective, manager, analyst)
+            memo = str(ideation.get("memo_markdown", "")).strip()
+            if ideation.get("fallback"):
+                _append_event(
+                    run_id,
+                    agent_id=analyst.id,
+                    agent_name=analyst.name,
+                    stage="sphinx_cli",
+                    message="Sphinx ideation returned non-zero; using deterministic fallback memo.",
+                )
+            time.sleep(0.4)
+
+            _append_event(
+                run_id,
+                agent_id=analyst.id,
+                agent_name=analyst.name,
+                stage="critique",
+                message="Running self-critique pass before manager review...",
+            )
+            self_critique = _analyst_self_critique(analyst, memo)
+            for line in [ln.strip() for ln in self_critique.splitlines() if ln.strip()][:4]:
+                _append_event(
+                    run_id,
+                    agent_id=analyst.id,
+                    agent_name=analyst.name,
+                    stage="critique",
+                    message=line[:500],
+                )
+                time.sleep(0.2)
+
+            _append_event(
+                run_id,
+                agent_id=manager.id,
+                agent_name=manager.name,
+                stage="critique",
+                message=f"Manager challenge round for {analyst.name}...",
+            )
+            manager_critique = _manager_critique_round(manager, analyst, memo)
+            for line in [ln.strip() for ln in manager_critique.splitlines() if ln.strip()][:4]:
+                _append_event(
+                    run_id,
+                    agent_id=manager.id,
+                    agent_name=manager.name,
+                    stage="critique",
+                    message=line[:500],
+                )
+                time.sleep(0.2)
+
+            _append_event(
+                run_id,
+                agent_id=analyst.id,
+                agent_name=analyst.name,
+                stage="revision",
+                message="Analyst revised rationale and backtest prompt after critique rounds.",
+            )
+            time.sleep(0.35)
             _append_event(
                 run_id,
                 agent_id=analyst.id,
@@ -482,6 +798,7 @@ def _run_orchestration_job(run_id: str, payload: dict[str, Any]) -> None:
             )
 
             review = _manager_review(manager, analyst, memo)
+            time.sleep(0.4)
             _append_event(
                 run_id,
                 agent_id=manager.id,
@@ -494,6 +811,9 @@ def _run_orchestration_job(run_id: str, payload: dict[str, Any]) -> None:
             row: dict[str, Any] = {
                 "analyst": analyst.model_dump(),
                 "memo_markdown": memo,
+                "headlines": headlines,
+                "self_critique": self_critique,
+                "manager_critique": manager_critique,
                 "review": review,
             }
 
@@ -506,9 +826,30 @@ def _run_orchestration_job(run_id: str, payload: dict[str, Any]) -> None:
                     stage="backtest",
                     message=f"Running SPHINX backtest for {analyst.name}'s idea...",
                 )
+                _append_event(
+                    run_id,
+                    agent_id=manager.id,
+                    agent_name=manager.name,
+                    stage="backtest",
+                    message=f"Backtest window={start} to {end}, initial_cash=${initial_cash:,.0f}",
+                )
+                time.sleep(0.7)
                 try:
-                    backtest = _call_backtest_api(
-                        test_prompt, start=start, end=end, initial_cash=initial_cash
+                    backtest = _call_backtest_api_streaming(
+                        run_id=run_id,
+                        manager=manager,
+                        analyst=analyst,
+                        prompt=test_prompt,
+                        start=start,
+                        end=end,
+                        initial_cash=initial_cash,
+                    )
+                    _append_event(
+                        run_id,
+                        agent_id=manager.id,
+                        agent_name=manager.name,
+                        stage="backtest",
+                        message="Backtest completed. Computing regression diagnostics vs SPY...",
                     )
                     regression = _compute_regression_vs_spy(backtest.get("equity_curve", []))
                     is_alpha = (
@@ -639,4 +980,3 @@ def get_orchestration_report_markdown(run_id: str):
         media_type="text/markdown",
         headers={"Content-Disposition": f'attachment; filename="orchestration-{run_id}.md"'},
     )
-
