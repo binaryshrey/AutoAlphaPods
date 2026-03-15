@@ -1,11 +1,11 @@
-"""Download historical commodity data from Yahoo Finance.
+"""Download historical currency data from Yahoo Finance.
 
 Bootstrap only:
 
-- Useful for prototyping the ingestion layer and synthetic tests.
+- Useful for prototyping the ingestion layer and early FX research.
 - Not sufficient for production point-in-time backtesting.
-- Yahoo futures series are not a substitute for a proper futures master,
-  contract rolls, and revision-aware vendor data.
+- Yahoo FX series are a convenience feed, not a revision-aware institutional
+  FX vendor.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ import sys
 import time
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, Tuple
+from typing import Dict, Iterator, Tuple
 
 import pandas as pd
 import yfinance as yf
@@ -24,27 +24,23 @@ import yfinance as yf
 if __package__ in {None, ""}:
     sys.path.append(str(Path(__file__).resolve().parents[3]))
 
-from backtesting.data.ingestion.commodity_universe import (
-    COMMODITY_ETF_TICKERS,
-    COMMODITY_FUTURES_TICKERS,
-)
+from backtesting.data.ingestion.currency_universe import CURRENCY_USD_TICKERS
 
-TickerBuckets = Dict[str, Dict[str, str]]
+CurrencyMetadata = Dict[str, str]
 
 DEFAULT_OUTPUT_DIR = (
-    Path(__file__).resolve().parents[2] / "storage" / "raw" / "yfinance"
+    Path(__file__).resolve().parents[2] / "storage" / "raw" / "yfinance" / "currencies"
 )
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Fetch Yahoo Finance commodity futures and commodity ETP history."
+        description="Fetch Yahoo Finance currency history for currencies versus USD."
     )
     parser.add_argument(
-        "--universe",
-        choices=("futures", "etfs", "all"),
+        "--group",
         default="all",
-        help="Which commodity universe to fetch.",
+        help="Which currency group to fetch: all or a specific bucket name.",
     )
     parser.add_argument(
         "--period",
@@ -89,22 +85,18 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def iter_universe(universe: str) -> Iterator[Tuple[str, str, str, str]]:
-    selected: Iterable[Tuple[str, TickerBuckets]]
-    if universe == "futures":
-        selected = [("futures", COMMODITY_FUTURES_TICKERS)]
-    elif universe == "etfs":
-        selected = [("etfs", COMMODITY_ETF_TICKERS)]
+def iter_universe(group: str) -> Iterator[Tuple[str, str, CurrencyMetadata]]:
+    if group == "all":
+        selected = CURRENCY_USD_TICKERS.items()
     else:
-        selected = [
-            ("futures", COMMODITY_FUTURES_TICKERS),
-            ("etfs", COMMODITY_ETF_TICKERS),
-        ]
+        if group not in CURRENCY_USD_TICKERS:
+            choices = ", ".join(sorted(CURRENCY_USD_TICKERS))
+            raise SystemExit(f"Unknown group '{group}'. Available groups: {choices}")
+        selected = [(group, CURRENCY_USD_TICKERS[group])]
 
-    for universe_name, buckets in selected:
-        for category, instruments in buckets.items():
-            for instrument_name, symbol in instruments.items():
-                yield universe_name, category, instrument_name, symbol
+    for category, instruments in selected:
+        for instrument_name, metadata in instruments.items():
+            yield category, instrument_name, metadata
 
 
 def download_history(
@@ -150,11 +142,10 @@ def write_dataset(
     frame: pd.DataFrame,
     *,
     output_dir: Path,
-    universe_name: str,
     category: str,
     instrument_name: str,
 ) -> Path:
-    target_dir = output_dir / universe_name / category
+    target_dir = output_dir / category
     target_dir.mkdir(parents=True, exist_ok=True)
     target_path = target_dir / f"{instrument_name}.csv"
     frame.to_csv(target_path, index=False)
@@ -179,7 +170,8 @@ def main() -> int:
     manifest = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "source": "yfinance",
-        "universe": args.universe,
+        "dataset": "currencies_vs_usd",
+        "group": args.group,
         "period": args.period,
         "interval": args.interval,
         "start": args.start,
@@ -189,7 +181,8 @@ def main() -> int:
         "failures": [],
     }
 
-    for universe_name, category, instrument_name, symbol in iter_universe(args.universe):
+    for category, instrument_name, metadata in iter_universe(args.group):
+        symbol = metadata["symbol"]
         try:
             history = download_history(
                 symbol,
@@ -202,6 +195,7 @@ def main() -> int:
                 manifest["failures"].append(
                     {
                         "instrument_name": instrument_name,
+                        "currency_code": metadata["currency_code"],
                         "symbol": symbol,
                         "reason": "empty_history",
                     }
@@ -216,6 +210,7 @@ def main() -> int:
                     manifest["failures"].append(
                         {
                             "instrument_name": instrument_name,
+                            "currency_code": metadata["currency_code"],
                             "symbol": symbol,
                             "reason": "insufficient_history",
                             "first_available_date": earliest_available_date.isoformat(),
@@ -227,16 +222,16 @@ def main() -> int:
                 output_path = write_dataset(
                     history,
                     output_dir=args.output_dir,
-                    universe_name=universe_name,
                     category=category,
                     instrument_name=instrument_name,
                 )
                 manifest["datasets"].append(
                     {
                         "instrument_name": instrument_name,
+                        "currency_code": metadata["currency_code"],
                         "symbol": symbol,
-                        "universe": universe_name,
                         "category": category,
+                        "quote_direction": metadata["quote_direction"],
                         "rows": int(len(history)),
                         "first_available_date": (
                             earliest_available_date.isoformat()
@@ -250,6 +245,7 @@ def main() -> int:
             manifest["failures"].append(
                 {
                     "instrument_name": instrument_name,
+                    "currency_code": metadata["currency_code"],
                     "symbol": symbol,
                     "reason": str(exc),
                 }
@@ -264,9 +260,11 @@ def main() -> int:
     print(
         json.dumps(
             {
+                "group": args.group,
                 "saved_datasets": len(manifest["datasets"]),
                 "failed_datasets": len(manifest["failures"]),
                 "manifest_path": str(manifest_path),
+                "completed_at": datetime.now(timezone.utc).isoformat(),
             },
             indent=2,
         )
