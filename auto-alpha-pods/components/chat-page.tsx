@@ -249,6 +249,14 @@ interface BacktestResult {
   position_series?: TickerPositionSeries[];
 }
 
+interface BacktestStreamLog {
+  id: string;
+  message: string;
+  stage: string;
+  level: "info" | "warning" | "error";
+  timestamp: string;
+}
+
 interface ChatMessage {
   id: string;
   role: "user" | "assistant";
@@ -258,6 +266,7 @@ interface ChatMessage {
   portfolioLoading?: boolean;
   backtest?: BacktestResult;
   backtestLoading?: boolean;
+  backtestLogs?: BacktestStreamLog[];
   news?: NewsItem[];
   followUps?: string[];
   newsLoading?: boolean;
@@ -417,6 +426,44 @@ function buildNewsContext(
       link: n.link,
     })),
   };
+}
+
+function appendBacktestLog(
+  existing: BacktestStreamLog[] | undefined,
+  next: BacktestStreamLog,
+): BacktestStreamLog[] {
+  return [...(existing ?? []), next].slice(-120);
+}
+
+function parseSseEvent(
+  rawChunk: string,
+): { event: string; data: unknown } | null {
+  const lines = rawChunk
+    .replace(/\r\n/g, "\n")
+    .split("\n")
+    .map((line) => line.trimEnd());
+  let event = "message";
+  const dataLines: string[] = [];
+
+  for (const line of lines) {
+    if (!line) continue;
+    if (line.startsWith("event:")) {
+      event = line.slice(6).trim();
+      continue;
+    }
+    if (line.startsWith("data:")) {
+      dataLines.push(line.slice(5).trim());
+    }
+  }
+
+  if (!dataLines.length) return null;
+  const payloadText = dataLines.join("\n");
+
+  try {
+    return { event, data: JSON.parse(payloadText) };
+  } catch {
+    return { event, data: payloadText };
+  }
 }
 
 // ─── Inline markdown renderer ─────────────────────────────────────────────────
@@ -894,6 +941,105 @@ function BacktestCard({ data }: { data: BacktestResult }) {
           </div>
         )}
       </div>
+    </div>
+  );
+}
+
+function BacktestLogPanel({
+  logs,
+  running,
+}: {
+  logs: BacktestStreamLog[];
+  running: boolean;
+}) {
+  const [open, setOpen] = useState(true);
+  const logEndRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (open) {
+      logEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+    }
+  }, [logs, open]);
+
+  const latest = logs[logs.length - 1];
+
+  return (
+    <div className="rounded-2xl border border-white/10 bg-[#0a0a0a] overflow-hidden">
+      <button
+        type="button"
+        onClick={() => setOpen((prev) => !prev)}
+        className="w-full flex items-center justify-between gap-3 px-4 py-3 bg-white/[0.02] hover:bg-white/[0.04] transition-colors"
+      >
+        <div className="min-w-0 flex items-center gap-3 text-left">
+          <div className="w-8 h-8 rounded-xl border border-emerald-500/20 bg-emerald-500/10 flex items-center justify-center shrink-0">
+            <RefreshCw
+              className={`w-4 h-4 text-emerald-400 ${running ? "animate-spin" : ""}`}
+            />
+          </div>
+          <div className="min-w-0">
+            <p className="text-xs font-semibold uppercase tracking-[0.18em] text-zinc-500">
+              Backtest Log
+            </p>
+            <p className="text-sm text-zinc-200 truncate">
+              {latest?.message || "Connecting to stream…"}
+            </p>
+          </div>
+        </div>
+        <div className="flex items-center gap-2 shrink-0">
+          <span className="rounded-full border border-white/10 bg-white/5 px-2.5 py-1 text-[10px] uppercase tracking-wide text-zinc-400">
+            {running ? `${logs.length || 1} events` : "complete"}
+          </span>
+          {open ? (
+            <ChevronUp className="w-4 h-4 text-zinc-500" />
+          ) : (
+            <ChevronDown className="w-4 h-4 text-zinc-500" />
+          )}
+        </div>
+      </button>
+
+      {open && (
+        <div className="border-t border-white/8 bg-black/50">
+          <div className="max-h-80 overflow-y-auto px-4 py-3 font-mono text-[11px] leading-5">
+            {logs.length ? (
+              <div className="space-y-2">
+                {logs.map((log) => {
+                  const timestamp = new Date(log.timestamp);
+                  const timeLabel = Number.isNaN(timestamp.getTime())
+                    ? "--:--:--"
+                    : timestamp.toLocaleTimeString("en-US", {
+                        hour12: false,
+                        hour: "2-digit",
+                        minute: "2-digit",
+                        second: "2-digit",
+                      });
+                  const levelClass =
+                    log.level === "error"
+                      ? "text-red-300"
+                      : log.level === "warning"
+                        ? "text-amber-300"
+                        : "text-zinc-200";
+
+                  return (
+                    <div
+                      key={log.id}
+                      className="grid grid-cols-[68px_92px_minmax(0,1fr)] gap-3"
+                    >
+                      <span className="text-zinc-600">{timeLabel}</span>
+                      <span className="text-zinc-500 uppercase truncate">
+                        {log.stage.replace(/_/g, " ")}
+                      </span>
+                      <span className={levelClass}>{log.message}</span>
+                    </div>
+                  );
+                })}
+                <div ref={logEndRef} />
+              </div>
+            ) : (
+              <div className="text-zinc-500">Waiting for the first log line…</div>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -1862,6 +2008,126 @@ export default function ChatPageContent() {
     [],
   );
 
+  const streamBacktestToMessage = useCallback(
+    async ({
+      messageId,
+      prompt,
+      start,
+      end,
+      initialCash,
+    }: {
+      messageId: string;
+      prompt: string;
+      start: string;
+      end: string;
+      initialCash: number;
+    }) => {
+      const res = await fetch(`${BACKTEST_API_BASE}/backtest/sphinx/stream`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          prompt,
+          start,
+          end,
+          initial_cash: initialCash,
+        }),
+      });
+
+      if (!res.ok || !res.body) {
+        throw new Error(`Backtest ${res.status}`);
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let finalResult: BacktestResult | null = null;
+
+      const handleRawEvent = (rawEvent: string) => {
+        const parsed = parseSseEvent(rawEvent);
+        if (!parsed) return;
+
+        if (parsed.event === "log") {
+          const payload = parsed.data as Partial<BacktestStreamLog> & {
+            message?: unknown;
+            stage?: unknown;
+            level?: unknown;
+            timestamp?: unknown;
+          };
+          const log: BacktestStreamLog = {
+            id: makeMessageId(),
+            message:
+              typeof payload.message === "string"
+                ? payload.message
+                : "Backtest update",
+            stage:
+              typeof payload.stage === "string" ? payload.stage : "progress",
+            level:
+              payload.level === "warning" || payload.level === "error"
+                ? payload.level
+                : "info",
+            timestamp:
+              typeof payload.timestamp === "string"
+                ? payload.timestamp
+                : new Date().toISOString(),
+          };
+
+          updateMessage(messageId, (prev) => ({
+            ...prev,
+            backtestLogs: appendBacktestLog(prev.backtestLogs, log),
+          }));
+          return;
+        }
+
+        if (parsed.event === "result") {
+          finalResult = parsed.data as BacktestResult;
+          updateMessage(messageId, (prev) => ({
+            ...prev,
+            role: "assistant",
+            content: "",
+            backtest: finalResult ?? undefined,
+            backtestLoading: false,
+          }));
+          return;
+        }
+
+        if (parsed.event === "error") {
+          const payload = parsed.data as { message?: unknown } | string;
+          const message =
+            typeof payload === "string"
+              ? payload
+              : typeof payload?.message === "string"
+                ? payload.message
+                : "Backtest failed";
+          throw new Error(message);
+        }
+      };
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        let separatorIndex = buffer.indexOf("\n\n");
+        while (separatorIndex !== -1) {
+          const rawEvent = buffer.slice(0, separatorIndex);
+          buffer = buffer.slice(separatorIndex + 2);
+          handleRawEvent(rawEvent);
+          separatorIndex = buffer.indexOf("\n\n");
+        }
+      }
+
+      const tail = buffer.trim();
+      if (tail) {
+        handleRawEvent(tail);
+      }
+
+      if (!finalResult) {
+        throw new Error("Backtest stream ended without a result.");
+      }
+    },
+    [updateMessage],
+  );
+
   const enrichAssistantMessage = useCallback(
     async ({
       messageId,
@@ -1921,33 +2187,20 @@ export default function ChatPageContent() {
               role: "assistant",
               content: "",
               backtestLoading: true,
+              backtestLogs: [],
             }
           : { id: assistantId, role: "assistant", content: "" },
       ]);
 
       try {
         if (runBacktest) {
-          const res = await fetch(`${BACKTEST_API_BASE}/backtest/sphinx`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              prompt: text,
-              start: "2015-01-01",
-              end: "2024-12-31",
-              initial_cash: 100000,
-            }),
+          await streamBacktestToMessage({
+            messageId: assistantId,
+            prompt: text,
+            start: "2015-01-01",
+            end: "2024-12-31",
+            initialCash: 100000,
           });
-
-          if (!res.ok) throw new Error(`Backtest ${res.status}`);
-          const payload = (await res.json()) as BacktestResult;
-
-          updateMessage(assistantId, (prev) => ({
-            ...prev,
-            role: "assistant",
-            content: "",
-            backtest: payload,
-            backtestLoading: false,
-          }));
           return;
         }
 
@@ -2013,6 +2266,7 @@ export default function ChatPageContent() {
                 role: "assistant",
                 content: "__BACKTEST_CARD__",
                 backtestLoading: true,
+                backtestLogs: [],
               }));
             }
           } else if (!accumulated.startsWith("_")) {
@@ -2038,32 +2292,16 @@ export default function ChatPageContent() {
                 })
               : undefined;
 
-            const backtestRes = await fetch(
-              `${BACKTEST_API_BASE}/backtest/sphinx`,
-              {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                  prompt: parsed?.prompt?.trim() || text,
-                  start: parsed?.start || "2015-01-01",
-                  end: parsed?.end || "2024-12-31",
-                  initial_cash:
-                    typeof parsed?.initial_cash === "number"
-                      ? parsed.initial_cash
-                      : 100000,
-                }),
-              },
-            );
-            if (!backtestRes.ok) throw new Error(`Backtest ${backtestRes.status}`);
-            const payload = (await backtestRes.json()) as BacktestResult;
-
-            updateMessage(assistantId, (prev) => ({
-              ...prev,
-              role: "assistant",
-              content: "",
-              backtest: payload,
-              backtestLoading: false,
-            }));
+            await streamBacktestToMessage({
+              messageId: assistantId,
+              prompt: parsed?.prompt?.trim() || text,
+              start: parsed?.start || "2015-01-01",
+              end: parsed?.end || "2024-12-31",
+              initialCash:
+                typeof parsed?.initial_cash === "number"
+                  ? parsed.initial_cash
+                  : 100000,
+            });
           } catch {
             updateMessage(assistantId, (prev) => ({
               ...prev,
@@ -2240,7 +2478,14 @@ export default function ChatPageContent() {
         setStreaming(false);
       }
     },
-    [coins, enrichAssistantMessage, messages, streaming, updateMessage],
+    [
+      coins,
+      enrichAssistantMessage,
+      messages,
+      streamBacktestToMessage,
+      streaming,
+      updateMessage,
+    ],
   );
 
   // Auto-send the initial query from URL params
@@ -2375,12 +2620,10 @@ export default function ChatPageContent() {
                         {msg.backtest ? (
                           <BacktestCard data={msg.backtest} />
                         ) : (
-                          <div className="bg-[#0a0a0a] border border-white/[0.07] rounded-xl p-6 flex items-center gap-3">
-                            <RefreshCw className="w-4 h-4 animate-spin text-zinc-500" />
-                            <span className="text-xs text-zinc-500">
-                              Running backtest…
-                            </span>
-                          </div>
+                          <BacktestLogPanel
+                            logs={msg.backtestLogs ?? []}
+                            running={Boolean(msg.backtestLoading)}
+                          />
                         )}
                       </div>
                     ) : msg.coinCard ? (
