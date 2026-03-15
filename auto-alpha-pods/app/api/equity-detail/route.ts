@@ -5,7 +5,7 @@ const YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart";
 const YFINANCE_BACKEND_URL =
   process.env.YFINANCE_BACKEND_URL ||
   (process.env.NODE_ENV === "production"
-    ? "https://falsemarkets.onrender.com"
+    ? "https://autoalphapods-1.onrender.com"
     : "http://localhost:8000");
 
 const RANGE: Record<string, { range: string; interval: string }> = {

@@ -287,6 +287,27 @@ function makeMessageId(): string {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+const BACKTEST_API_BASE =
+  process.env.NEXT_PUBLIC_BACKTEST_API_BASE_URL?.replace(/\/$/, "") ||
+  "https://autoalphapods-1.onrender.com";
+
+const BACKTEST_STRONG_HINT_RE =
+  /\b(backtest|back-test|equity curve|max drawdown|cagr|sharpe|sortino|calmar|win rate)\b/i;
+const BACKTEST_STRATEGY_HINT_RE =
+  /\b(strategy|signal|signals|weights?|allocation|rebalance|long|short|entry|exit)\b/i;
+const BACKTEST_EVAL_HINT_RE =
+  /\b(test|evaluate|simulate|simulation|optimi[sz]e|historical|history|performance|returns?)\b/i;
+const YEAR_HINT_RE = /\b(?:19|20)\d{2}\b/;
+
+function shouldRunBacktest(prompt: string): boolean {
+  const text = prompt.trim();
+  if (!text) return false;
+  if (BACKTEST_STRONG_HINT_RE.test(text)) return true;
+  const hasStrategyHint = BACKTEST_STRATEGY_HINT_RE.test(text);
+  if (!hasStrategyHint) return false;
+  return BACKTEST_EVAL_HINT_RE.test(text) || YEAR_HINT_RE.test(text);
+}
+
 function buildPortfolioContext(
   portfolio?: PortfolioData,
 ): PortfolioContextPayload | undefined {
@@ -395,7 +416,7 @@ const SOURCE_URLS: Record<string, string> = {
   Alpaca: "https://alpaca.markets",
   Polymarket: "https://polymarket.com",
   "Alternative.me": "https://alternative.me/crypto/fear-and-greed-index/",
-  "Claude AI": "https://claude.ai",
+  OpenRouter: "https://openrouter.ai",
 };
 
 function SourcesFooter({ raw }: { raw: string }) {
@@ -1546,6 +1567,13 @@ export default function ChatPageContent() {
     async (rawPrompt: string) => {
       const text = rawPrompt.trim();
       if (!text || streaming) return;
+      const latestPortfolio = [...messages]
+        .reverse()
+        .find((m) => m.portfolio)?.portfolio;
+      const portfolioContext = buildPortfolioContext(latestPortfolio);
+      const newsContext = buildNewsContext(messages);
+      const runBacktest = shouldRunBacktest(text);
+
       setQuery("");
       setStreaming(true);
 
@@ -1555,18 +1583,19 @@ export default function ChatPageContent() {
       setMessages((prev) => [
         ...prev,
         { id: userId, role: "user", content: text },
-        {
-          id: assistantId,
-          role: "assistant",
-          content: "",
-          backtestLoading: true,
-        },
+        runBacktest
+          ? {
+              id: assistantId,
+              role: "assistant",
+              content: "",
+              backtestLoading: true,
+            }
+          : { id: assistantId, role: "assistant", content: "" },
       ]);
 
       try {
-        const res = await fetch(
-          "https://autoalphapods-1.onrender.com/backtest/sphinx",
-          {
+        if (runBacktest) {
+          const res = await fetch(`${BACKTEST_API_BASE}/backtest/sphinx`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
@@ -1575,31 +1604,311 @@ export default function ChatPageContent() {
               end: "2024-12-31",
               initial_cash: 100000,
             }),
-          },
-        );
+          });
 
-        if (!res.ok) throw new Error(`Backtest ${res.status}`);
-        const payload = (await res.json()) as BacktestResult;
+          if (!res.ok) throw new Error(`Backtest ${res.status}`);
+          const payload = (await res.json()) as BacktestResult;
 
-        updateMessage(assistantId, (prev) => ({
-          ...prev,
-          role: "assistant",
-          content: "",
-          backtest: payload,
-          backtestLoading: false,
-        }));
+          updateMessage(assistantId, (prev) => ({
+            ...prev,
+            role: "assistant",
+            content: "",
+            backtest: payload,
+            backtestLoading: false,
+          }));
+          return;
+        }
+
+        const res = await fetch("/api/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            message: text,
+            portfolioContext,
+            newsContext,
+            backtestEnabled: true,
+          }),
+        });
+        if (!res.ok || !res.body) throw new Error("No body");
+
+        const reader = res.body.getReader();
+        const dec = new TextDecoder();
+        let accumulated = "";
+        let cardMode: "asset" | "portfolio" | "backtest" | null = null;
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          const chunk = dec.decode(value);
+          accumulated += chunk;
+
+          if (
+            accumulated.startsWith("__ASSET_CARD__") ||
+            accumulated.startsWith("__COIN_CARD__")
+          ) {
+            if (!cardMode) {
+              cardMode = "asset";
+              updateMessage(assistantId, (prev) => ({
+                ...prev,
+                role: "assistant",
+                content: "__ASSET_CARD__",
+                coinCard: {
+                  assetType: "crypto",
+                  coinId: undefined,
+                  symbol: "",
+                  name: "",
+                  range: "1D",
+                  loading: true,
+                },
+              }));
+            }
+          } else if (accumulated.startsWith("__PORTFOLIO_CARD__")) {
+            if (!cardMode) {
+              cardMode = "portfolio";
+              updateMessage(assistantId, (prev) => ({
+                ...prev,
+                role: "assistant",
+                content: "__PORTFOLIO_CARD__",
+                portfolio: undefined,
+                portfolioLoading: true,
+              }));
+            }
+          } else if (accumulated.startsWith("__BACKTEST_CARD__")) {
+            if (!cardMode) {
+              cardMode = "backtest";
+              updateMessage(assistantId, (prev) => ({
+                ...prev,
+                role: "assistant",
+                content: "__BACKTEST_CARD__",
+                backtestLoading: true,
+              }));
+            }
+          } else if (!accumulated.startsWith("_")) {
+            updateMessage(assistantId, (prev) => ({
+              ...prev,
+              role: "assistant",
+              content: accumulated,
+            }));
+          }
+        }
+
+        if (cardMode === "backtest") {
+          try {
+            const match = accumulated.match(
+              /__BACKTEST_CARD__\s*(\{[^}]+\})\s*([\s\S]*)/,
+            );
+            const parsed = match?.[1]
+              ? (JSON.parse(match[1]) as {
+                  prompt?: string;
+                  start?: string;
+                  end?: string;
+                  initial_cash?: number;
+                })
+              : undefined;
+
+            const backtestRes = await fetch(
+              `${BACKTEST_API_BASE}/backtest/sphinx`,
+              {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  prompt: parsed?.prompt?.trim() || text,
+                  start: parsed?.start || "2015-01-01",
+                  end: parsed?.end || "2024-12-31",
+                  initial_cash:
+                    typeof parsed?.initial_cash === "number"
+                      ? parsed.initial_cash
+                      : 100000,
+                }),
+              },
+            );
+            if (!backtestRes.ok) throw new Error(`Backtest ${backtestRes.status}`);
+            const payload = (await backtestRes.json()) as BacktestResult;
+
+            updateMessage(assistantId, (prev) => ({
+              ...prev,
+              role: "assistant",
+              content: "",
+              backtest: payload,
+              backtestLoading: false,
+            }));
+          } catch {
+            updateMessage(assistantId, (prev) => ({
+              ...prev,
+              role: "assistant",
+              content: "Sorry, I couldn't run that backtest. Please try again.",
+              backtestLoading: false,
+            }));
+          }
+        } else if (cardMode === "asset") {
+          try {
+            const match = accumulated.match(
+              /__(?:ASSET|COIN)_CARD__\s*(\{[^}]+\})\s*([\s\S]*)/,
+            );
+            if (!match) throw new Error("No JSON found in asset card response");
+
+            const parsed = JSON.parse(match[1]) as {
+              assetType?: "crypto" | "equity";
+              coinId?: string;
+              symbol: string;
+              name: string;
+              buyIntent?: boolean;
+            };
+            const assetType =
+              parsed.assetType === "equity" ? "equity" : "crypto";
+            const commentary = match[2].trim();
+            const symbol = (parsed.symbol || "").trim().toUpperCase();
+            const name = (parsed.name || "").trim() || symbol;
+            const buyIntent = parsed.buyIntent;
+
+            let detail: CoinDetail;
+            let coinId = parsed.coinId;
+
+            if (assetType === "crypto") {
+              const cached = coins.find(
+                (c) =>
+                  c.id === coinId ||
+                  c.symbol.toUpperCase() === symbol ||
+                  c.name.toLowerCase() === name.toLowerCase(),
+              );
+
+              if (cached) {
+                const sparkline = cached.sparkline_in_7d?.price ?? [];
+                const now = Date.now();
+                const step =
+                  sparkline.length > 1
+                    ? (7 * 24 * 3600 * 1000) / (sparkline.length - 1)
+                    : 3600 * 1000;
+                detail = {
+                  id: cached.id,
+                  name: cached.name,
+                  symbol: cached.symbol.toUpperCase(),
+                  image: cached.image,
+                  current_price: cached.current_price,
+                  price_change_24h: cached.price_change_24h,
+                  price_change_percentage_24h:
+                    cached.price_change_percentage_24h,
+                  market_cap: cached.market_cap,
+                  total_volume: cached.total_volume,
+                  high_24h: cached.high_24h,
+                  low_24h: cached.low_24h,
+                  ath: 0,
+                  atl: 0,
+                  last_updated: new Date().toISOString(),
+                  prices: sparkline.map(
+                    (p, i) =>
+                      [now - (sparkline.length - 1 - i) * step, p] as [
+                        number,
+                        number,
+                      ],
+                  ),
+                  asset_type: "crypto",
+                };
+                coinId = cached.id;
+              } else {
+                const resolvedCoinId = coinId || symbol.toLowerCase();
+                const detailRes = await fetch(
+                  `/api/coin-detail?coinId=${encodeURIComponent(resolvedCoinId)}`,
+                );
+                if (!detailRes.ok)
+                  throw new Error("Failed to load crypto detail");
+                detail = (await detailRes.json()) as CoinDetail;
+                coinId = detail.id || resolvedCoinId;
+              }
+            } else {
+              const detailRes = await fetch(
+                `/api/equity-detail?symbol=${encodeURIComponent(symbol)}`,
+              );
+              detail = (await detailRes.json()) as CoinDetail;
+              if (!detailRes.ok)
+                throw new Error("Failed to load equity detail");
+            }
+
+            updateMessage(assistantId, (prev) => ({
+              ...prev,
+              role: "assistant",
+              content: commentary || "__ASSET_CARD__",
+              coinCard: {
+                assetType,
+                coinId,
+                symbol,
+                name,
+                range: "1W",
+                loading: false,
+                data: detail,
+                buyIntent,
+              },
+            }));
+
+            void enrichAssistantMessage({
+              messageId: assistantId,
+              userText: text,
+              coinName: name,
+              coinSymbol: symbol,
+            });
+          } catch {
+            updateMessage(assistantId, (prev) => ({
+              ...prev,
+              role: "assistant",
+              content: "Could not load coin data. Please try again.",
+            }));
+          }
+        } else if (cardMode === "portfolio") {
+          try {
+            const match = accumulated.match(
+              /__PORTFOLIO_CARD__\s*(\{[^}]*\})?\s*([\s\S]*)/,
+            );
+            const commentary = match?.[2]?.trim() || "";
+
+            const portfolioRes = await fetch("/api/alpaca/portfolio");
+            if (!portfolioRes.ok) {
+              throw new Error("Failed to load portfolio.");
+            }
+            const portfolioData = (await portfolioRes.json()) as PortfolioData;
+
+            updateMessage(assistantId, (prev) => ({
+              ...prev,
+              role: "assistant",
+              content: commentary || "__PORTFOLIO_CARD__",
+              portfolio: portfolioData,
+              portfolioLoading: false,
+            }));
+
+            const firstSymbol = portfolioData.positions?.[0]?.symbol;
+            void enrichAssistantMessage({
+              messageId: assistantId,
+              userText: text,
+              coinSymbol: firstSymbol,
+            });
+          } catch {
+            updateMessage(assistantId, (prev) => ({
+              ...prev,
+              role: "assistant",
+              content:
+                "I couldn't load your portfolio right now. Please try again.",
+              portfolioLoading: false,
+            }));
+          }
+        } else {
+          void enrichAssistantMessage({
+            messageId: assistantId,
+            userText: text,
+          });
+        }
       } catch {
         updateMessage(assistantId, (prev) => ({
           ...prev,
           role: "assistant",
-          content: "Sorry, I couldn't run that backtest. Please try again.",
-          backtestLoading: false,
+          content: runBacktest
+            ? "Sorry, I couldn't run that backtest. Please try again."
+            : "Sorry, I couldn't process your request. Please try again.",
+          backtestLoading: runBacktest ? false : prev.backtestLoading,
         }));
       } finally {
         setStreaming(false);
       }
     },
-    [messages, streaming, updateMessage],
+    [coins, enrichAssistantMessage, messages, streaming, updateMessage],
   );
 
   // Auto-send the initial query from URL params
@@ -1939,7 +2248,7 @@ export default function ChatPageContent() {
             </div>
             <p className="text-center text-[10px] text-zinc-700 mt-2">
               <TrendingUp className="w-3 h-3 inline -mt-0.5 mr-1" />
-              Powered by Claude AI · Market data from CoinGecko, Yahoo Finance &
+              Powered by OpenRouter · Market data from CoinGecko, Yahoo Finance &
               Polymarket
             </p>
           </form>

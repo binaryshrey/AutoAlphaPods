@@ -443,7 +443,7 @@ const SOURCE_URLS: Record<string, string> = {
   Alpaca: "https://alpaca.markets",
   Polymarket: "https://polymarket.com",
   "Alternative.me": "https://alternative.me/crypto/fear-and-greed-index/",
-  "Claude AI": "https://claude.ai",
+  OpenRouter: "https://openrouter.ai",
 };
 
 function makeMessageId(): string {
@@ -522,7 +522,7 @@ function buildNewsContext(
 }
 
 function SourcesFooter({ raw }: { raw: string }) {
-  // raw = "CoinGecko · Polymarket · Claude AI"
+  // raw = "CoinGecko · Polymarket · OpenRouter"
   const sources = raw
     .split(/\s*·\s*/)
     .map((s) => s.trim())
@@ -601,7 +601,7 @@ function MarkdownMessage({
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
 
-    // Detect **Sources:** line (Claude appends this at the end)
+    // Detect **Sources:** line (assistant appends this at the end)
     const srcMatch = line.match(/^\*\*Sources:\*\*\s*(.+)/);
     if (srcMatch) {
       flushList();
@@ -1690,6 +1690,7 @@ export default function CryptoDashboard() {
             message: text,
             portfolioContext,
             newsContext,
+            backtestEnabled: false,
           }),
         });
         if (!res.body) throw new Error("No body");
@@ -2640,7 +2641,7 @@ export default function CryptoDashboard() {
             </div>
             <p className="text-center text-sm text-zinc-700 mt-2">
               <TrendingUp className="w-3 h-3 inline -mt-0.5 mr-1" />
-              Powered by Claude AI · Market data from CoinGecko, Yahoo Finance &
+              Powered by OpenRouter · Market data from CoinGecko, Yahoo Finance &
               Polymarket
             </p>
           </form>
