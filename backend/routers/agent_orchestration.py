@@ -31,6 +31,8 @@ logger = logging.getLogger("uvicorn.error")
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
+ANSI_ESCAPE_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+
 
 def _openrouter_key() -> str | None:
     return os.getenv("OPENROUTER_KEY")
@@ -205,6 +207,150 @@ def _fetch_news_headlines(query: str, limit: int = 4) -> list[str]:
         return []
 
 
+def _strip_ansi(text: str) -> str:
+    return ANSI_ESCAPE_RE.sub("", text or "")
+
+
+def _memo_has_required_sections(text: str) -> bool:
+    normalized = text.replace("\r\n", "\n")
+    required_patterns = (
+        r"^##\s+Thesis\s*$",
+        r"^##\s+Evidence\s*$",
+        r"^##\s+Risks(?:\s*/\s*Failure Modes)?\s*$",
+        r"^##\s+Backtest Prompt\s*$",
+        r"^##\s+Sources\s*$",
+    )
+    return all(
+        re.search(pattern, normalized, flags=re.IGNORECASE | re.MULTILINE)
+        for pattern in required_patterns
+    )
+
+
+def _trim_trailing_cli_chatter(text: str) -> str:
+    lines = text.strip().splitlines()
+    trimmed: list[str] = []
+    seen_sources = False
+
+    for line in lines:
+        stripped = line.strip()
+        if re.match(r"^##\s+Sources\s*$", stripped, flags=re.IGNORECASE):
+            seen_sources = True
+        if seen_sources and (
+            re.match(r"^\[\d{1,2}:\d{2}:\d{2}\s[AP]M\]", stripped)
+            or stripped.startswith("Sphinx:")
+        ):
+            break
+        trimmed.append(line)
+
+    return "\n".join(trimmed).strip()
+
+
+def _extract_memo_from_text(text: str) -> str:
+    cleaned = _strip_ansi(text).replace("\r\n", "\n").strip()
+    if not cleaned:
+        return ""
+
+    fenced_blocks = re.findall(
+        r"```(?:markdown|md)?\s*(.*?)```",
+        cleaned,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    candidates = [block.strip() for block in fenced_blocks if block.strip()]
+
+    thesis_idx = cleaned.lower().find("## thesis")
+    if thesis_idx >= 0:
+        candidates.append(cleaned[thesis_idx:].strip())
+    candidates.append(cleaned)
+
+    for candidate in candidates:
+        if _memo_has_required_sections(candidate):
+            return _trim_trailing_cli_chatter(candidate)
+    return ""
+
+
+def _coerce_notebook_text(value: Any) -> str:
+    if isinstance(value, list):
+        return "".join(str(item) for item in value)
+    if isinstance(value, str):
+        return value
+    return ""
+
+
+def _extract_memo_from_notebook(notebook_path: Path) -> str:
+    if not notebook_path.exists():
+        return ""
+
+    try:
+        notebook = json.loads(notebook_path.read_text())
+    except Exception:
+        logger.warning("Failed to parse Sphinx notebook for memo extraction: %s", notebook_path)
+        return ""
+
+    for cell in reversed(notebook.get("cells", [])):
+        candidates: list[str] = []
+        source = _coerce_notebook_text(cell.get("source"))
+        if source:
+            candidates.append(source)
+
+        for output in cell.get("outputs", []):
+            text_output = _coerce_notebook_text(output.get("text"))
+            if text_output:
+                candidates.append(text_output)
+
+            data = output.get("data", {})
+            if isinstance(data, dict):
+                for key in ("text/markdown", "text/plain"):
+                    rendered = _coerce_notebook_text(data.get(key))
+                    if rendered:
+                        candidates.append(rendered)
+
+        for candidate in candidates:
+            memo = _extract_memo_from_text(candidate)
+            if memo:
+                return memo
+
+    return ""
+
+
+def _extract_sphinx_memo(stdout: str, notebook_path: Path) -> str:
+    memo = _extract_memo_from_text(stdout)
+    if memo:
+        return memo
+    return _extract_memo_from_notebook(notebook_path)
+
+
+def _extract_thesis_preview(memo_markdown: str, limit: int = 180) -> str:
+    match = re.search(
+        r"^##\s+Thesis\s*$\n(.*?)(?=^##\s+|\Z)",
+        memo_markdown.replace("\r\n", "\n"),
+        flags=re.IGNORECASE | re.MULTILINE | re.DOTALL,
+    )
+    if not match:
+        return ""
+
+    preview = " ".join(
+        line.strip("- ").strip()
+        for line in match.group(1).splitlines()
+        if line.strip()
+    )
+    preview = re.sub(r"\s+", " ", preview).strip()
+    if len(preview) <= limit:
+        return preview
+    return preview[: limit - 3].rstrip() + "..."
+
+
+def _build_memo_generated_log(memo_markdown: str) -> str:
+    word_count = len(re.findall(r"\b[\w'-]+\b", memo_markdown))
+    source_count = len(
+        re.findall(r"^\[\d+\]\s+https?://", memo_markdown, flags=re.MULTILINE)
+    )
+    thesis_preview = _extract_thesis_preview(memo_markdown)
+    message = f"Memo generated ({word_count} words, {source_count} sources)."
+    if thesis_preview:
+        message += f" Thesis: {thesis_preview}"
+    return message
+
+
 def _run_sphinx_ideation(
     run_id: str,
     objective: str,
@@ -265,7 +411,7 @@ Output format:
         )
         if process.stdout is not None:
             for raw_line in process.stdout:
-                line = raw_line.rstrip()
+                line = _strip_ansi(raw_line).rstrip()
                 output_lines.append(raw_line)
                 if line:
                     _append_event(
@@ -277,8 +423,13 @@ Output format:
                     )
         return_code = process.wait()
         stdout = "".join(output_lines).strip()
-        if return_code == 0 and stdout:
-            return {"memo_markdown": stdout, "sphinx_stdout": stdout, "fallback": False}
+        memo = _extract_sphinx_memo(stdout, notebook_path)
+        if return_code == 0 and memo:
+            return {
+                "memo_markdown": memo,
+                "sphinx_stdout": _strip_ansi(stdout),
+                "fallback": False,
+            }
     except Exception as err:
         logger.exception(
             "Sphinx ideation failed for run_id=%s analyst_id=%s analyst_name=%s",
@@ -314,7 +465,11 @@ Create a monthly-rebalanced strategy that rotates across {", ".join(analyst.asse
 [1] https://fred.stlouisfed.org/
 [2] https://finance.yahoo.com/
 """
-    return {"memo_markdown": fallback, "sphinx_stdout": "".join(output_lines), "fallback": True}
+    return {
+        "memo_markdown": fallback,
+        "sphinx_stdout": _strip_ansi("".join(output_lines)),
+        "fallback": True,
+    }
 
 
 def _analyst_self_critique(run_id: str, analyst: AgentConfig, memo_markdown: str) -> str:
@@ -916,6 +1071,14 @@ def _run_orchestration_job(run_id: str, payload: dict[str, Any]) -> None:
                     agent_name=analyst.name,
                     stage="sphinx_cli",
                     message="Sphinx ideation returned non-zero; using deterministic fallback memo.",
+                )
+            if memo:
+                _append_event(
+                    run_id,
+                    agent_id=analyst.id,
+                    agent_name=analyst.name,
+                    stage="proposal",
+                    message=_build_memo_generated_log(memo)[:700],
                 )
             time.sleep(0.4)
 
