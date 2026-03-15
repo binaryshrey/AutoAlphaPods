@@ -198,6 +198,12 @@ MACRO_FIELD_NAMES = [
 SPHINX_OUTPUT_CODE_BLOCK = re.compile(r"```(?:python)?\s*(.*?)```", re.DOTALL)
 MONTH_END_RESAMPLE_RE = re.compile(r"(\.resample\(\s*)(['\"])M\2")
 MONTH_END_FREQ_RE = re.compile(r"(freq\s*=\s*)(['\"])M\2")
+FILLNA_METHOD_ONLY_RE = re.compile(
+    r"\.fillna\(\s*method\s*=\s*(['\"])(ffill|pad|bfill|backfill)\1\s*\)"
+)
+FILLNA_METHOD_LIMIT_RE = re.compile(
+    r"\.fillna\(\s*method\s*=\s*(['\"])(ffill|pad|bfill|backfill)\1\s*,\s*limit\s*=\s*([^,)]+)\s*\)"
+)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -496,6 +502,29 @@ def _normalize_generated_code_for_pandas(
     if updated != normalized:
         normalized = updated
         changes.append("Normalized `freq='M'` to `freq='ME'` for pandas 3 compatibility.")
+
+    updated = FILLNA_METHOD_LIMIT_RE.sub(
+        lambda match: (
+            f".{'ffill' if match.group(2) in {'ffill', 'pad'} else 'bfill'}"
+            f"(limit={match.group(3).strip()})"
+        ),
+        normalized,
+    )
+    if updated != normalized:
+        normalized = updated
+        changes.append(
+            "Normalized deprecated `fillna(method=..., limit=...)` to `.ffill()`/`.bfill()` for pandas compatibility."
+        )
+
+    updated = FILLNA_METHOD_ONLY_RE.sub(
+        lambda match: f".{'ffill' if match.group(2) in {'ffill', 'pad'} else 'bfill'}()",
+        normalized,
+    )
+    if updated != normalized:
+        normalized = updated
+        changes.append(
+            "Normalized deprecated `fillna(method=...)` to `.ffill()`/`.bfill()` for pandas compatibility."
+        )
 
     for message in changes:
         logger.warning(message)
