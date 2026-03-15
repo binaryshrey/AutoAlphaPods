@@ -233,6 +233,7 @@ Requirements:
 3) Include a "Backtest Prompt" section with one concise strategy prompt suitable for a code-generation backtest agent.
 4) Include a "Sources" section with numbered citations and URLs.
 5) Keep to 350-550 words.
+6) You can ideate using files but NONE OF YOUR FILES WOULD BE VISIBLE TO USER. Print the output completely to STDOUT and it will be captured by the system.
 
 Output format:
 ## Thesis

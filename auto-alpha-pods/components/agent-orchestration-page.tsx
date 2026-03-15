@@ -70,7 +70,7 @@ const defaultManager: AgentConfig = {
   name: "PM Athena",
   specialization: "Adversarial macro PM",
   system_prompt:
-    "Be skeptical. Force clear hypotheses, explicit risks, and robust validation before approval.",
+    "Be skeptical. Force clear hypotheses, explicit risks, and robust validation before approval. Be conducive to simpler solutions.",
   assets: ["SPY", "TLT", "GLD", "QQQ"],
 };
 
@@ -80,7 +80,7 @@ const defaultAnalysts: AgentConfig[] = [
     name: "Rates Hawk",
     specialization: "Rates and curve regimes",
     system_prompt:
-      "Focus on duration/inflation relationships and policy-cycle transitions.",
+      "Focus on duration/inflation relationships and policy-cycle transitions. Makes simple rules.",
     assets: ["TLT", "IEF", "TIP", "SHY"],
   },
   {
@@ -88,7 +88,7 @@ const defaultAnalysts: AgentConfig[] = [
     name: "Risk Sentinel",
     specialization: "Risk-on / risk-off cross-asset shifts",
     system_prompt:
-      "Look for risk-regime shifts with defensiveness and downside control.",
+      "Look for risk-regime shifts with defensiveness and downside control. Makes simple rules.",
     assets: ["SPY", "QQQ", "GLD", "HYG"],
   },
   {
@@ -96,7 +96,7 @@ const defaultAnalysts: AgentConfig[] = [
     name: "Inflation Scout",
     specialization: "Inflation and commodities",
     system_prompt:
-      "Prioritize inflation momentum, real rates, and commodity hedging behavior.",
+      "Prioritize inflation momentum, real rates, and commodity hedging behavior. Momentum based strategies.",
     assets: ["GLD", "SLV", "USO", "TIP"],
   },
 ];
