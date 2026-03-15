@@ -25,6 +25,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from openai import OpenAI
 from pydantic import BaseModel
 from supabase import create_client
+from routers.agent_orchestration import router as orchestration_router
 
 warnings.filterwarnings("ignore")
 logger = logging.getLogger("uvicorn.error")
@@ -238,6 +239,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.include_router(orchestration_router)
 
 
 # ─────────────────────────────────────────────────────────────

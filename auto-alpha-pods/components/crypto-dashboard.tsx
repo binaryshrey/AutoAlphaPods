@@ -11,6 +11,7 @@ import {
   RefreshCw,
   BarChart2,
   Zap,
+  Sparkles,
   Globe,
   ArrowUpRight,
   ArrowDownRight,
@@ -2223,6 +2224,15 @@ export default function CryptoDashboard() {
           </span>
 
           <div className="flex items-center gap-4">
+            <button
+              onClick={() => router.push("/orchestration")}
+              className="group relative overflow-hidden flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-linear-to-r from-emerald-400/30 via-cyan-400/20 to-violet-400/30 border border-emerald-300/40 text-sm font-semibold text-emerald-100 hover:text-white hover:border-emerald-300/75 transition-all whitespace-nowrap shadow-[0_0_22px_rgba(16,185,129,0.28)]"
+            >
+              <span className="absolute inset-0 bg-linear-to-r from-transparent via-white/20 to-transparent -translate-x-full group-hover:translate-x-full transition-transform duration-700" />
+              <Sparkles className="w-3.5 h-3.5 relative" />
+              <span className="relative">AGENT ORCHESTRATION</span>
+            </button>
+
             {/* Trading Dashboard button */}
             <button
               onClick={() => setShowTradingModal(true)}
