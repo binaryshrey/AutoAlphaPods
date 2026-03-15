@@ -25,7 +25,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from openai import OpenAI
 from pydantic import BaseModel
 from supabase import create_client
-from routers.agent_orchestration import router as orchestration_router
 
 warnings.filterwarnings("ignore")
 logger = logging.getLogger("uvicorn.error")
@@ -34,6 +33,8 @@ from dotenv import load_dotenv
 import os
 
 load_dotenv()
+
+from routers.agent_orchestration import router as orchestration_router
 
 SUPABASE_URL    = os.getenv("SUPABASE_URL")
 SUPABASE_KEY    = os.getenv("SUPABASE_KEY")

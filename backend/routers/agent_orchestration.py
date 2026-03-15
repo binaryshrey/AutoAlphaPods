@@ -18,6 +18,7 @@ from urllib.error import URLError, HTTPError
 import numpy as np
 import pandas as pd
 import yfinance as yf
+from dotenv import load_dotenv
 from fastapi import APIRouter, BackgroundTasks, HTTPException
 from fastapi.responses import PlainTextResponse
 from openai import OpenAI
@@ -26,18 +27,34 @@ from pydantic import BaseModel, Field
 
 router = APIRouter(prefix="/orchestration", tags=["Orchestration"])
 
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
-OPENROUTER_KEY = os.getenv("OPENROUTER_KEY")
-OPENROUTER_BASE = os.getenv("OPENROUTER_BASE", "https://openrouter.ai/api/v1")
-OPENROUTER_MODEL = os.getenv("MODEL", "openai/gpt-4o-mini")
-SPHINX_API_KEY = os.getenv("SPHINX_API_KEY")
-ORCHESTRATION_BACKTEST_URL = os.getenv(
-    "ORCHESTRATION_BACKTEST_URL", "http://127.0.0.1:8000/backtest/sphinx"
-)
-ORCHESTRATION_BACKTEST_STREAM_URL = os.getenv(
-    "ORCHESTRATION_BACKTEST_STREAM_URL",
-    ORCHESTRATION_BACKTEST_URL.rstrip("/") + "/stream",
-)
+
+def _openrouter_key() -> str | None:
+    return os.getenv("OPENROUTER_KEY")
+
+
+def _openrouter_base() -> str:
+    return os.getenv("OPENROUTER_BASE", "https://openrouter.ai/api/v1")
+
+
+def _openrouter_model() -> str:
+    return os.getenv("MODEL", "openai/gpt-4o-mini")
+
+
+def _sphinx_api_key() -> str | None:
+    return os.getenv("SPHINX_API_KEY")
+
+
+def _orchestration_backtest_url() -> str:
+    return os.getenv("ORCHESTRATION_BACKTEST_URL", "http://127.0.0.1:8000/backtest/sphinx")
+
+
+def _orchestration_backtest_stream_url() -> str:
+    return os.getenv(
+        "ORCHESTRATION_BACKTEST_STREAM_URL",
+        _orchestration_backtest_url().rstrip("/") + "/stream",
+    )
 
 RUN_STORE: dict[str, dict[str, Any]] = {}
 RUN_STORE_LOCK = Lock()
@@ -102,12 +119,13 @@ def _resolve_sphinx_cli() -> str:
 
 
 def _build_sphinx_env() -> dict[str, str]:
-    if not SPHINX_API_KEY:
+    sphinx_api_key = _sphinx_api_key()
+    if not sphinx_api_key:
         raise RuntimeError(
             "SPHINX_API_KEY is not set. Export it for non-interactive Sphinx auth."
         )
     env = os.environ.copy()
-    env["SPHINX_API_KEY"] = SPHINX_API_KEY
+    env["SPHINX_API_KEY"] = sphinx_api_key
     return env
 
 
@@ -284,18 +302,19 @@ Give 3 concise bullets:
 
 
 def _run_openrouter_chat(system_prompt: str, user_prompt: str) -> str:
-    if not OPENROUTER_KEY:
+    openrouter_key = _openrouter_key()
+    if not openrouter_key:
         return ""
     client = OpenAI(
-        api_key=OPENROUTER_KEY,
-        base_url=OPENROUTER_BASE,
+        api_key=openrouter_key,
+        base_url=_openrouter_base(),
         default_headers={
             "HTTP-Referer": "https://autoalphapods.local",
             "X-Title": "AutoAlphaPods Orchestrator",
         },
     )
     completion = client.chat.completions.create(
-        model=OPENROUTER_MODEL,
+        model=_openrouter_model(),
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
@@ -331,7 +350,7 @@ def _manager_review(
         "revised_backtest_prompt": "",
         "risk_flags": ["Model risk", "Regime instability"],
     }
-    if not OPENROUTER_KEY:
+    if not _openrouter_key():
         return default_review
 
     system_prompt = f"""
@@ -392,7 +411,7 @@ def _call_backtest_api(prompt: str, start: str, end: str, initial_cash: float) -
     }
     data = json.dumps(payload).encode("utf-8")
     req = urllib_request.Request(
-        ORCHESTRATION_BACKTEST_URL,
+        _orchestration_backtest_url(),
         data=data,
         headers={"Content-Type": "application/json"},
         method="POST",
@@ -425,7 +444,7 @@ def _call_backtest_api_streaming(
     }
     data = json.dumps(payload).encode("utf-8")
     req = urllib_request.Request(
-        ORCHESTRATION_BACKTEST_STREAM_URL,
+        _orchestration_backtest_stream_url(),
         data=data,
         headers={
             "Content-Type": "application/json",
@@ -686,7 +705,7 @@ def _run_orchestration_job(run_id: str, payload: dict[str, Any]) -> None:
             stage="manager",
             message=(
                 "SPHINX auth mode: API key"
-                if SPHINX_API_KEY
+                if _sphinx_api_key()
                 else "SPHINX auth mode: missing API key (fallbacks may apply)"
             ),
         )
