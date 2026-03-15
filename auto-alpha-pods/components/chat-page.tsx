@@ -342,6 +342,12 @@ function makeMessageId(): string {
 const BACKTEST_API_BASE =
   process.env.NEXT_PUBLIC_BACKTEST_API_BASE_URL?.replace(/\/$/, "") ||
   "https://autoalphapods-1.onrender.com";
+const DEFAULT_BACKTEST_START = "2015-01-01";
+const DEFAULT_BACKTEST_INITIAL_CASH = 100000;
+
+function getDefaultBacktestEndDate(): string {
+  return new Date().toISOString().slice(0, 10);
+}
 
 const BACKTEST_STRONG_HINT_RE =
   /\b(backtest|back-test|equity curve|max drawdown|cagr|sharpe|sortino|calmar|win rate)\b/i;
@@ -2197,9 +2203,9 @@ export default function ChatPageContent() {
           await streamBacktestToMessage({
             messageId: assistantId,
             prompt: text,
-            start: "2015-01-01",
-            end: "2024-12-31",
-            initialCash: 100000,
+            start: DEFAULT_BACKTEST_START,
+            end: getDefaultBacktestEndDate(),
+            initialCash: DEFAULT_BACKTEST_INITIAL_CASH,
           });
           return;
         }
@@ -2295,12 +2301,12 @@ export default function ChatPageContent() {
             await streamBacktestToMessage({
               messageId: assistantId,
               prompt: parsed?.prompt?.trim() || text,
-              start: parsed?.start || "2015-01-01",
-              end: parsed?.end || "2024-12-31",
+              start: parsed?.start || DEFAULT_BACKTEST_START,
+              end: parsed?.end || getDefaultBacktestEndDate(),
               initialCash:
                 typeof parsed?.initial_cash === "number"
                   ? parsed.initial_cash
-                  : 100000,
+                  : DEFAULT_BACKTEST_INITIAL_CASH,
             });
           } catch {
             updateMessage(assistantId, (prev) => ({

@@ -47,7 +47,7 @@ OPENROUTER_KEY  = os.getenv("OPENROUTER_KEY")
 OPENROUTER_BASE = os.getenv("OPENROUTER_BASE", "https://openrouter.ai/api/v1")
 MODEL           = os.getenv("MODEL", "anthropic/claude-sonnet-4-5")
 START           = os.getenv("START", "2000-05-01")
-END             = os.getenv("END", "2025-01-01")
+END             = os.getenv("END", datetime.utcnow().date().isoformat())
 SPHINX_API_KEY  = os.getenv("SPHINX_API_KEY")
 
 # Fail fast on startup if required keys are missing
@@ -355,6 +355,78 @@ def _normalize_commodity_symbols(symbols: Optional[list[str]]) -> tuple[str, ...
     return tuple(requested)
 
 
+def _format_timestamp(value: Any) -> str:
+    if value is None:
+        return "n/a"
+    try:
+        if pd.isna(value):
+            return "n/a"
+    except Exception:
+        pass
+    try:
+        return pd.Timestamp(value).date().isoformat()
+    except Exception:
+        return str(value)
+
+
+def _format_index_date_range(index: pd.Index) -> str:
+    if index is None or len(index) == 0:
+        return "empty"
+    return f"{_format_timestamp(index.min())} -> {_format_timestamp(index.max())}"
+
+
+def _preview_columns(columns: list[str], limit: int = 8) -> list[str]:
+    if len(columns) <= limit:
+        return columns
+    return [*columns[:limit], f"... (+{len(columns) - limit} more)"]
+
+
+def _summarize_price_frame(prices: pd.DataFrame) -> dict[str, Any]:
+    if prices.empty:
+        return {
+            "rows": 0,
+            "columns": 0,
+            "date_range": "empty",
+            "columns_preview": [],
+            "non_null_counts": {},
+        }
+
+    preview_columns = prices.columns.tolist()[:5]
+    non_null_counts = {
+        str(column): int(prices[column].notna().sum())
+        for column in preview_columns
+    }
+    return {
+        "rows": int(len(prices)),
+        "columns": int(len(prices.columns)),
+        "date_range": _format_index_date_range(prices.index),
+        "columns_preview": _preview_columns(prices.columns.tolist()),
+        "non_null_counts": non_null_counts,
+    }
+
+
+def _summarize_signal_frame(signals: pd.DataFrame) -> dict[str, Any]:
+    if signals.empty:
+        return {
+            "rows": 0,
+            "columns": 0,
+            "date_range": "empty",
+            "columns_preview": signals.columns.tolist(),
+            "nonzero_rows": 0,
+            "nonzero_cells": 0,
+        }
+
+    nonzero_mask = signals.fillna(0).ne(0)
+    return {
+        "rows": int(len(signals)),
+        "columns": int(len(signals.columns)),
+        "date_range": _format_index_date_range(signals.index),
+        "columns_preview": _preview_columns(signals.columns.tolist()),
+        "nonzero_rows": int(nonzero_mask.any(axis=1).sum()),
+        "nonzero_cells": int(nonzero_mask.sum().sum()),
+    }
+
+
 def _infer_macro_columns(code: str) -> list[str]:
     referenced = []
     for column in MACRO_FIELD_NAMES:
@@ -583,34 +655,80 @@ def _infer_referenced_assets(code: str) -> list[str]:
 def _load_prices_sync(tickers: list[str], start: str, end: str) -> pd.DataFrame:
     requested = list(dict.fromkeys([ticker for ticker in tickers if ticker]))
     if not requested:
+        logger.warning("Price load skipped: no tickers requested. start=%s end=%s", start, end)
         return pd.DataFrame()
 
     commodity_symbols = set(_get_commodity_universe_summary()["symbols"])
     commodity_tickers = [ticker for ticker in requested if ticker in commodity_symbols]
     market_tickers = [ticker for ticker in requested if ticker not in commodity_symbols]
 
+    logger.info(
+        "Loading prices. start=%s end=%s requested=%s market=%s commodities=%s",
+        start,
+        end,
+        requested,
+        market_tickers,
+        commodity_tickers,
+    )
+
     frames: list[pd.DataFrame] = []
     if market_tickers:
         market_prices = _load_yfinance_prices_sync(market_tickers, start, end)
+        logger.info(
+            "Market price load complete. rows=%s cols=%s range=%s tickers=%s",
+            len(market_prices),
+            len(market_prices.columns),
+            _format_index_date_range(market_prices.index),
+            market_tickers,
+        )
         if not market_prices.empty:
             frames.append(market_prices)
 
     if commodity_tickers:
         commodity_prices = _get_commodity_prices_sync(commodity_tickers)
+        logger.info(
+            "Commodity price cache load complete. rows=%s cols=%s range=%s tickers=%s",
+            len(commodity_prices),
+            len(commodity_prices.columns),
+            _format_index_date_range(commodity_prices.index),
+            commodity_tickers,
+        )
         if not commodity_prices.empty:
             commodity_prices = commodity_prices.loc[
                 (commodity_prices.index >= pd.to_datetime(start))
                 & (commodity_prices.index <= pd.to_datetime(end))
             ]
+            logger.info(
+                "Commodity price range filtered. rows=%s cols=%s range=%s tickers=%s",
+                len(commodity_prices),
+                len(commodity_prices.columns),
+                _format_index_date_range(commodity_prices.index),
+                commodity_tickers,
+            )
             frames.append(commodity_prices)
 
     if not frames:
+        logger.warning(
+            "Price load produced no frames. start=%s end=%s requested=%s",
+            start,
+            end,
+            requested,
+        )
         return pd.DataFrame()
 
     prices = pd.concat(frames, axis=1).sort_index()
     prices = prices.loc[:, ~prices.columns.duplicated()]
     available = [ticker for ticker in requested if ticker in prices.columns]
-    return prices[available]
+    result = prices[available]
+    logger.info(
+        "Combined price load complete. rows=%s cols=%s range=%s available=%s missing=%s",
+        len(result),
+        len(result.columns),
+        _format_index_date_range(result.index),
+        available,
+        [ticker for ticker in requested if ticker not in available],
+    )
+    return result
 
 
 def _emit_stream_event(stream_log: StreamLogFn, event: str, **payload: Any) -> None:
@@ -903,6 +1021,17 @@ def _execute_strategy(
     prices: pd.DataFrame,
     commodities: pd.DataFrame,
 ) -> pd.DataFrame:
+    logger.info(
+        "Executing strategy. macro_rows=%s macro_cols=%s macro_range=%s price_rows=%s price_cols=%s price_range=%s commodity_rows=%s commodity_symbols=%s",
+        len(macro),
+        len(macro.columns),
+        _format_index_date_range(macro.index),
+        len(prices),
+        len(prices.columns),
+        _format_index_date_range(prices.index),
+        len(commodities),
+        len(commodities.index.get_level_values("symbol").unique()) if not commodities.empty else 0,
+    )
     namespace = {"pd": pd, "np": np}
     try:
         exec(code, namespace)
@@ -932,6 +1061,7 @@ def _execute_strategy(
         raise RuntimeError(f"Runtime error in generate_signals(): {e}\n\nCode:\n{code}") from e
     if not isinstance(signals, pd.DataFrame):
         raise RuntimeError(f"generate_signals() must return DataFrame, got {type(signals)}")
+    logger.info("Strategy execution complete. signal_summary=%s", _summarize_signal_frame(signals))
     return signals
 
 
@@ -939,20 +1069,74 @@ def _simulate_portfolio(
     signals: pd.DataFrame,
     prices: pd.DataFrame,
     initial_cash: float,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
 ) -> tuple[pd.Series, pd.Series, pd.DataFrame, pd.DataFrame]:
+    requested_range = f"{start} -> {end}" if start and end else "unspecified"
+    logger.info(
+        "Simulating portfolio. requested_range=%s signal_summary=%s price_summary=%s",
+        requested_range,
+        _summarize_signal_frame(signals),
+        _summarize_price_frame(prices),
+    )
+    if signals.empty or signals.index.empty:
+        raise RuntimeError(
+            "Strategy returned no signal rows. "
+            f"requested_range={requested_range} signal_columns={signals.columns.tolist()}"
+        )
+    if prices.empty or prices.index.empty:
+        raise RuntimeError(
+            "No price history rows were loaded for the requested backtest window. "
+            f"requested_range={requested_range} signal_columns={signals.columns.tolist()}"
+        )
     tickers = [t for t in signals.columns if t in prices.columns]
     if not tickers:
         raise RuntimeError(
             f"No ticker overlap: signals={signals.columns.tolist()} "
             f"prices={prices.columns.tolist()}"
         )
-    px      = prices[tickers].copy()
+    logger.info(
+        "Portfolio overlap resolved. tickers=%s signal_only=%s price_only=%s",
+        tickers,
+        [column for column in signals.columns.tolist() if column not in prices.columns],
+        [column for column in prices.columns.tolist() if column not in signals.columns],
+    )
+    px = prices[tickers].copy().sort_index()
+    px = px.loc[~px.index.duplicated(keep="last")]
+    px = px.dropna(how="all")
+    if px.empty:
+        raise RuntimeError(
+            "Referenced assets have no usable price rows in the requested backtest window. "
+            f"requested_range={requested_range} tickers={tickers} "
+            f"loaded_price_range={_format_index_date_range(prices.index)}"
+        )
+    if len(px.index) < 2:
+        raise RuntimeError(
+            "Need at least 2 price rows to compute returns. "
+            f"requested_range={requested_range} tickers={tickers} "
+            f"loaded_price_range={_format_index_date_range(px.index)}"
+        )
     returns = px.pct_change()
     weights = signals[tickers].reindex(returns.index, method="ffill").fillna(0)
     row_sum = weights.abs().sum(axis=1).replace(0, 1)
     weights = weights.div(row_sum, axis=0).shift(1).fillna(0)
     port_returns = (weights * returns).sum(axis=1).replace([np.inf, -np.inf], np.nan).fillna(0)
     equity       = (1 + port_returns).cumprod() * initial_cash
+    logger.info(
+        "Portfolio simulation intermediate stats. aligned_price_rows=%s aligned_price_range=%s return_rows=%s nonzero_return_days=%s weight_nonzero_rows=%s",
+        len(px),
+        _format_index_date_range(px.index),
+        len(port_returns),
+        int(port_returns.fillna(0).ne(0).sum()),
+        int(weights.fillna(0).ne(0).any(axis=1).sum()),
+    )
+    if port_returns.empty or equity.empty:
+        raise RuntimeError(
+            "Portfolio simulation produced no returns after aligning signals and prices. "
+            f"requested_range={requested_range} tickers={tickers} "
+            f"signal_range={_format_index_date_range(signals.index)} "
+            f"price_range={_format_index_date_range(px.index)}"
+        )
     return port_returns, equity, weights, px
 
 
@@ -1112,8 +1296,32 @@ def _run_single_backtest(
         columns=macro_columns,
     )
     macro = _get_macro_sync(macro_columns)
+    _stream_log(
+        stream_log,
+        "Macro data loaded.",
+        stage="load_macro",
+        rows=len(macro),
+        date_range=_format_index_date_range(macro.index),
+        columns_preview=_preview_columns(macro.columns.tolist()),
+    )
     _stream_log(stream_log, "Loading commodity data.", stage="load_commodities")
     commodities = _get_commodity_sync()
+    _stream_log(
+        stream_log,
+        "Commodity data loaded.",
+        stage="load_commodities",
+        rows=len(commodities),
+        date_range=(
+            _format_index_date_range(commodities.index.get_level_values("timestamp"))
+            if not commodities.empty
+            else "empty"
+        ),
+        symbols_preview=(
+            _preview_columns(commodities.index.get_level_values("symbol").unique().tolist())
+            if not commodities.empty
+            else []
+        ),
+    )
     referenced = _infer_referenced_assets(code)
 
     _stream_log(
@@ -1125,12 +1333,34 @@ def _run_single_backtest(
         end=end,
     )
     prices  = _load_prices_sync(referenced, start, end)
+    _stream_log(
+        stream_log,
+        "Price history loaded.",
+        stage="load_prices",
+        **_summarize_price_frame(prices),
+    )
     _stream_log(stream_log, "Executing generated strategy.", stage="execute_strategy")
     signals = _execute_strategy(code, macro, prices, commodities)
+    _stream_log(
+        stream_log,
+        "Strategy execution produced signals.",
+        stage="execute_strategy",
+        **_summarize_signal_frame(signals),
+    )
 
     _stream_log(stream_log, "Simulating portfolio.", stage="simulate_portfolio")
     port_returns, equity, weights, aligned_prices = _simulate_portfolio(
-        signals, prices, initial_cash
+        signals, prices, initial_cash, start=start, end=end
+    )
+    _stream_log(
+        stream_log,
+        "Portfolio simulation complete.",
+        stage="simulate_portfolio",
+        tickers=_preview_columns(aligned_prices.columns.tolist()),
+        aligned_price_rows=len(aligned_prices),
+        aligned_price_range=_format_index_date_range(aligned_prices.index),
+        return_rows=len(port_returns),
+        nonzero_return_days=int(port_returns.fillna(0).ne(0).sum()),
     )
     _stream_log(stream_log, "Computing metrics.", stage="compute_metrics")
     metrics = _compute_metrics(
@@ -1188,8 +1418,32 @@ def _run_single_backtest_sphinx(
         columns=macro_columns,
     )
     macro = _get_macro_sync(macro_columns)
+    _stream_log(
+        stream_log,
+        "Macro data loaded.",
+        stage="load_macro",
+        rows=len(macro),
+        date_range=_format_index_date_range(macro.index),
+        columns_preview=_preview_columns(macro.columns.tolist()),
+    )
     _stream_log(stream_log, "Loading commodity data.", stage="load_commodities")
     commodities = _get_commodity_sync()
+    _stream_log(
+        stream_log,
+        "Commodity data loaded.",
+        stage="load_commodities",
+        rows=len(commodities),
+        date_range=(
+            _format_index_date_range(commodities.index.get_level_values("timestamp"))
+            if not commodities.empty
+            else "empty"
+        ),
+        symbols_preview=(
+            _preview_columns(commodities.index.get_level_values("symbol").unique().tolist())
+            if not commodities.empty
+            else []
+        ),
+    )
     referenced = _infer_referenced_assets(code)
 
     _stream_log(
@@ -1201,11 +1455,39 @@ def _run_single_backtest_sphinx(
         end=end,
     )
     prices = _load_prices_sync(referenced, start, end)
+    _stream_log(
+        stream_log,
+        "Price history loaded.",
+        stage="load_prices",
+        **_summarize_price_frame(prices),
+    )
     _stream_log(stream_log, "Executing generated strategy.", stage="execute_strategy")
     signals = _execute_strategy(code, macro, prices, commodities)
+    _stream_log(
+        stream_log,
+        "Strategy execution produced signals.",
+        stage="execute_strategy",
+        **_summarize_signal_frame(signals),
+    )
 
     _stream_log(stream_log, "Simulating portfolio.", stage="simulate_portfolio")
-    port_returns, equity, weights, px = _simulate_portfolio(signals, prices, initial_cash)
+    port_returns, equity, weights, px = _simulate_portfolio(
+        signals,
+        prices,
+        initial_cash,
+        start=start,
+        end=end,
+    )
+    _stream_log(
+        stream_log,
+        "Portfolio simulation complete.",
+        stage="simulate_portfolio",
+        tickers=_preview_columns(px.columns.tolist()),
+        aligned_price_rows=len(px),
+        aligned_price_range=_format_index_date_range(px.index),
+        return_rows=len(port_returns),
+        nonzero_return_days=int(port_returns.fillna(0).ne(0).sum()),
+    )
     _stream_log(stream_log, "Computing metrics.", stage="compute_metrics")
     metrics = _compute_metrics(
         port_returns,
@@ -1246,6 +1528,15 @@ def _build_backtest_stream_response(
             push_event("done", {"status": "completed"})
         except Exception as exc:
             logger.exception("Streaming backtest worker failed: %s", exc)
+            push_event(
+                "log",
+                {
+                    "message": f"Backtest failed: {exc}",
+                    "stage": "error",
+                    "level": "error",
+                    "timestamp": datetime.utcnow().isoformat() + "Z",
+                },
+            )
             push_event(
                 "error",
                 {
@@ -1418,8 +1709,14 @@ def health():
         "status"          : "ok",
         "macro_loaded"    : macro is not None,
         "macro_rows"      : len(macro) if macro is not None else 0,
+        "macro_date_range": _format_index_date_range(macro.index) if macro is not None else "empty",
         "commodity_loaded": commodity is not None,
         "commodity_rows"  : len(commodity) if commodity is not None else 0,
+        "commodity_date_range": (
+            _format_index_date_range(commodity.index.get_level_values("timestamp"))
+            if commodity is not None and len(commodity.index)
+            else "empty"
+        ),
     }
 
 
