@@ -2,21 +2,24 @@ import warnings
 import asyncio
 import json
 import logging
+import queue
 import re
 import shlex
 import shutil
 import subprocess
 import tempfile
+import threading
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Callable, Any
 
 import numpy as np
 import pandas as pd
 import yfinance as yf
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Query
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from openai import OpenAI
 from pydantic import BaseModel
@@ -263,6 +266,10 @@ class BatchResult(BaseModel):
     errors: list[dict]
 
 
+StreamLogFn = Optional[Callable[[str, dict[str, Any]], None]]
+_STREAM_SENTINEL = object()
+
+
 # ─────────────────────────────────────────────────────────────
 # CORE ENGINE (sync — run in executor)
 # ─────────────────────────────────────────────────────────────
@@ -350,7 +357,37 @@ def _load_prices_sync(tickers: list, start: str, end: str) -> pd.DataFrame:
     return closes.sort_index()
 
 
-def _ask_llm_sync(prompt: str, model: str) -> str:
+def _emit_stream_event(stream_log: StreamLogFn, event: str, **payload: Any) -> None:
+    if stream_log is None:
+        return
+    stream_log(event, payload)
+
+
+def _stream_log(
+    stream_log: StreamLogFn,
+    message: str,
+    *,
+    stage: str,
+    level: str = "info",
+    **extra: Any,
+) -> None:
+    _emit_stream_event(
+        stream_log,
+        "log",
+        message=message,
+        stage=stage,
+        level=level,
+        timestamp=datetime.utcnow().isoformat() + "Z",
+        **extra,
+    )
+
+
+def _ask_llm_sync(prompt: str, model: str, stream_log: StreamLogFn = None) -> str:
+    _stream_log(
+        stream_log,
+        f"Requesting strategy code from model {model}.",
+        stage="generate_strategy",
+    )
     client = OpenAI(
         api_key=OPENROUTER_KEY,
         base_url=OPENROUTER_BASE,
@@ -373,6 +410,12 @@ def _ask_llm_sync(prompt: str, model: str) -> str:
             line for line in code.split("\n")
             if not line.strip().startswith("```")
         )
+    _stream_log(
+        stream_log,
+        "Strategy code received from model.",
+        stage="generate_strategy",
+        code_lines=len(code.splitlines()),
+    )
     return code.strip()
 
 
@@ -465,12 +508,20 @@ def _extract_code_from_notebook(notebook_path: Path) -> str:
     raise RuntimeError(f"Could not find generate_signals() in notebook: {notebook_path}")
 
 
-def _log_sphinx_logs(notebook_path: Path, stdout: str, stderr: str) -> None:
+def _log_sphinx_logs(
+    notebook_path: Path,
+    stdout: str,
+    stderr: str,
+    stream_log: StreamLogFn = None,
+) -> None:
     messages: list[tuple[str, str]] = [("info", f"Sphinx notebook: {notebook_path}")]
     if stdout.strip():
         messages.append(("info", f"Sphinx stdout:\n{stdout.strip()}"))
     if stderr.strip():
         messages.append(("warning", f"Sphinx stderr:\n{stderr.strip()}"))
+
+    for level, message in messages:
+        _stream_log(stream_log, message, stage="sphinx_cli", level=level)
 
     if logger.handlers:
         for level, message in messages:
@@ -492,7 +543,8 @@ def _build_sphinx_env() -> dict:
     return env
 
 
-def _ensure_sphinx_ready() -> None:
+def _ensure_sphinx_ready(stream_log: StreamLogFn = None) -> None:
+    _stream_log(stream_log, "Checking Sphinx CLI auth status.", stage="sphinx_setup")
     cmd = [_resolve_sphinx_cli(), "status"]
     result = subprocess.run(
         cmd,
@@ -506,10 +558,11 @@ def _ensure_sphinx_ready() -> None:
             "sphinx-cli status failed. Run `sphinx-cli login` first.\n"
             f"stdout:\n{result.stdout}\n\nstderr:\n{result.stderr}"
         )
+    _stream_log(stream_log, "Sphinx CLI is ready.", stage="sphinx_setup")
 
 
-def _ask_sphinx_sync(user_prompt: str) -> str:
-    _ensure_sphinx_ready()
+def _ask_sphinx_sync(user_prompt: str, stream_log: StreamLogFn = None) -> str:
+    _ensure_sphinx_ready(stream_log)
     prompt = f"{SYSTEM_PROMPT}\n\nTrading strategy:\n{user_prompt}"
 
     keep_notebooks = os.getenv("SPHINX_KEEP_NOTEBOOKS", "").lower() in {"1", "true", "yes"}
@@ -524,22 +577,37 @@ def _ask_sphinx_sync(user_prompt: str) -> str:
         notebook_path = Path(temp_dir) / "strategy.ipynb"
 
     cmd = _build_sphinx_command(prompt, str(notebook_path))
-    result = subprocess.run(
+    _stream_log(
+        stream_log,
+        f"Running Sphinx CLI with notebook path {notebook_path}.",
+        stage="generate_strategy",
+    )
+    process = subprocess.Popen(
         cmd,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         text=True,
-        check=False,
+        bufsize=1,
         env=_build_sphinx_env(),
     )
-    _log_sphinx_logs(notebook_path, result.stdout, result.stderr)
-    if result.returncode != 0:
+    output_lines: list[str] = []
+    if process.stdout is not None:
+        for line in process.stdout:
+            output_lines.append(line)
+            cleaned = line.rstrip()
+            if cleaned:
+                _stream_log(stream_log, cleaned, stage="sphinx_cli")
+    return_code = process.wait()
+    stdout = "".join(output_lines)
+    _log_sphinx_logs(notebook_path, "", "", stream_log)
+    if return_code != 0:
         raise RuntimeError(
             "sphinx-cli chat failed.\n"
             f"Command: {' '.join(cmd)}\n"
-            f"stdout:\n{result.stdout}\n\nstderr:\n{result.stderr}"
+            f"stdout:\n{stdout}"
         )
 
-    stdout = result.stdout.strip()
+    stdout = stdout.strip()
     try:
         code = _extract_code_from_sphinx_output(stdout)
     except RuntimeError:
@@ -548,6 +616,12 @@ def _ask_sphinx_sync(user_prompt: str) -> str:
     if temp_dir and not keep_notebooks:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
+    _stream_log(
+        stream_log,
+        "Strategy code received from Sphinx CLI.",
+        stage="generate_strategy",
+        code_lines=len(code.splitlines()),
+    )
     return code
 
 
@@ -653,22 +727,50 @@ def _run_single_backtest(
     start: str,
     end: str,
     initial_cash: float,
+    stream_log: StreamLogFn = None,
 ) -> dict:
     """Full pipeline for one prompt. Runs sync — call via executor."""
-    code = _ask_llm_sync(prompt, model)
-    macro = _get_macro_sync(_infer_macro_columns(code))
+    _stream_log(stream_log, "Backtest started.", stage="start")
+    code = _ask_llm_sync(prompt, model, stream_log)
+    macro_columns = _infer_macro_columns(code)
+    _stream_log(
+        stream_log,
+        f"Loading macro data for {len(macro_columns)} columns.",
+        stage="load_macro",
+        columns=macro_columns,
+    )
+    macro = _get_macro_sync(macro_columns)
     referenced = [t for t in ALL_ETFS if f'"{t}"' in code or f"'{t}'" in code]
     if not referenced:
         referenced = ["TLT", "HYG", "GLD", "SPY", "TIP", "SHY"]
 
+    _stream_log(
+        stream_log,
+        f"Loading price history for {len(referenced)} tickers.",
+        stage="load_prices",
+        tickers=referenced,
+        start=start,
+        end=end,
+    )
     prices  = _load_prices_sync(referenced, start, end)
+    _stream_log(stream_log, "Executing generated strategy.", stage="execute_strategy")
     signals = _execute_strategy(code, macro, prices)
 
+    _stream_log(stream_log, "Simulating portfolio.", stage="simulate_portfolio")
     port_returns, equity = _simulate_portfolio(signals, prices, initial_cash)
+    _stream_log(stream_log, "Computing metrics.", stage="compute_metrics")
     metrics = _compute_metrics(
         port_returns, equity, prompt,
         tickers=signals.columns.tolist(),
         code=code,
+    )
+    _stream_log(
+        stream_log,
+        "Backtest completed.",
+        stage="done",
+        tickers=signals.columns.tolist(),
+        sharpe=metrics["sharpe"],
+        total_return=metrics["total_return"],
     )
     return metrics
 
@@ -678,18 +780,38 @@ def _run_single_backtest_sphinx(
     start: str,
     end: str,
     initial_cash: float,
+    stream_log: StreamLogFn = None,
 ) -> dict:
     """Full pipeline for one prompt using Sphinx CLI. Runs sync — call via executor."""
-    code = _ask_sphinx_sync(prompt)
-    macro = _get_macro_sync(_infer_macro_columns(code))
+    _stream_log(stream_log, "Backtest started.", stage="start")
+    code = _ask_sphinx_sync(prompt, stream_log)
+    macro_columns = _infer_macro_columns(code)
+    _stream_log(
+        stream_log,
+        f"Loading macro data for {len(macro_columns)} columns.",
+        stage="load_macro",
+        columns=macro_columns,
+    )
+    macro = _get_macro_sync(macro_columns)
     referenced = [t for t in ALL_ETFS if f'"{t}"' in code or f"'{t}'" in code]
     if not referenced:
         referenced = ["TLT", "HYG", "GLD", "SPY", "TIP", "SHY"]
 
+    _stream_log(
+        stream_log,
+        f"Loading price history for {len(referenced)} tickers.",
+        stage="load_prices",
+        tickers=referenced,
+        start=start,
+        end=end,
+    )
     prices = _load_prices_sync(referenced, start, end)
+    _stream_log(stream_log, "Executing generated strategy.", stage="execute_strategy")
     signals = _execute_strategy(code, macro, prices)
 
+    _stream_log(stream_log, "Simulating portfolio.", stage="simulate_portfolio")
     port_returns, equity = _simulate_portfolio(signals, prices, initial_cash)
+    _stream_log(stream_log, "Computing metrics.", stage="compute_metrics")
     metrics = _compute_metrics(
         port_returns,
         equity,
@@ -697,7 +819,73 @@ def _run_single_backtest_sphinx(
         tickers=signals.columns.tolist(),
         code=code,
     )
+    _stream_log(
+        stream_log,
+        "Backtest completed.",
+        stage="done",
+        tickers=signals.columns.tolist(),
+        sharpe=metrics["sharpe"],
+        total_return=metrics["total_return"],
+    )
     return metrics
+
+
+def _format_sse(event: str, payload: dict[str, Any]) -> str:
+    return f"event: {event}\ndata: {json.dumps(payload, default=str)}\n\n"
+
+
+def _build_backtest_stream_response(
+    worker: Callable[[Callable[[str, dict[str, Any]], None]], dict],
+) -> StreamingResponse:
+    event_queue: "queue.Queue[Any]" = queue.Queue()
+
+    def push_event(event: str, payload: dict[str, Any]) -> None:
+        event_queue.put((event, payload))
+
+    def run_worker() -> None:
+        try:
+            result = worker(push_event)
+            push_event("result", result)
+            push_event("done", {"status": "completed"})
+        except Exception as exc:
+            push_event(
+                "error",
+                {
+                    "message": str(exc),
+                    "type": type(exc).__name__,
+                    "timestamp": datetime.utcnow().isoformat() + "Z",
+                },
+            )
+        finally:
+            event_queue.put(_STREAM_SENTINEL)
+
+    def event_stream():
+        yield _format_sse(
+            "ready",
+            {
+                "status": "streaming",
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+            },
+        )
+        worker_thread = threading.Thread(target=run_worker, daemon=True)
+        worker_thread.start()
+
+        while True:
+            item = event_queue.get()
+            if item is _STREAM_SENTINEL:
+                break
+            event, payload = item
+            yield _format_sse(event, payload)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 def _run_batch_job(job_id: str, request: BatchBacktestRequest):
@@ -896,6 +1084,34 @@ async def run_backtest(request: BacktestRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/backtest/stream", tags=["Backtest"])
+def stream_backtest(request: BacktestRequest):
+    """Run a single backtest and stream structured progress events via SSE."""
+
+    def worker(push_event: Callable[[str, dict[str, Any]], None]) -> dict:
+        push_event(
+            "meta",
+            {
+                "mode": "openrouter",
+                "model": request.model,
+                "start": request.start,
+                "end": request.end,
+                "initial_cash": request.initial_cash,
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+            },
+        )
+        return _run_single_backtest(
+            request.prompt,
+            request.model,
+            request.start,
+            request.end,
+            request.initial_cash,
+            stream_log=push_event,
+        )
+
+    return _build_backtest_stream_response(worker)
+
+
 @app.post("/backtest/sphinx", response_model=MetricsResult, tags=["Backtest"])
 async def run_backtest_sphinx(request: BacktestRequest):
     """
@@ -914,6 +1130,32 @@ async def run_backtest_sphinx(request: BacktestRequest):
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/backtest/sphinx/stream", tags=["Backtest"])
+def stream_backtest_sphinx(request: BacktestRequest):
+    """Run a single Sphinx backtest and stream structured progress events via SSE."""
+
+    def worker(push_event: Callable[[str, dict[str, Any]], None]) -> dict:
+        push_event(
+            "meta",
+            {
+                "mode": "sphinx",
+                "start": request.start,
+                "end": request.end,
+                "initial_cash": request.initial_cash,
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+            },
+        )
+        return _run_single_backtest_sphinx(
+            request.prompt,
+            request.start,
+            request.end,
+            request.initial_cash,
+            stream_log=push_event,
+        )
+
+    return _build_backtest_stream_response(worker)
 
 
 @app.post("/backtest/batch", response_model=JobStatus, tags=["Backtest"])
